@@ -1,0 +1,7 @@
+fun outerFunction() {
+  fun localFunction() {
+    print "I'm local!";
+  }
+
+  localFunction();
+}

@@ -1,0 +1,17 @@
+local java = {}
+
+function java.toolchain(prefix)
+    local prefix = prefix or ""
+    return {
+        javac := $(prefix)javac
+    }
+end
+
+function java.rules(tools)
+    return r{
+        $ %.class: %.java
+            $(tools.javac) $input
+    }
+end
+
+return java
