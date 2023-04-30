@@ -4,15 +4,22 @@ local tools = java.toolchain("")
 local rules = java.rules(tools)
 
 return b{
-    $ com/craftinginterpreters/lox/Lox.class:
-        $(tools.javac) com/craftinginterpreters/lox/TokenType.java
-        $(tools.javac) com/craftinginterpreters/lox/Scanner.java
-        $(tools.javac) com/craftinginterpreters/lox/Token.java
-        $(tools.javac) com/craftinginterpreters/lox/Lox.java
 
-    $ com/craftinginterpreters/tool/AstPrinter.class:
+    $ com/craftinginterpreters/lox/Scanner.class: com/craftinginterpreters/lox/TokenType.class
+
+    $ com/craftinginterpreters/lox/Token.class: com/craftinginterpreters/lox/TokenType.class
+
+    $ com/craftinginterpreters/lox/Lox.class: com/craftinginterpreters/lox/TokenType.class com/craftinginterpreters/lox/Scanner.class com/craftinginterpreters/lox/Token.class
+
+    -- code gen
+
+    $ com/craftinginterpreters/lox/Expr.java: com/craftinginterpreters/tool/GenerateAst.class
+        java com.craftinginterpreters.tool.GenerateAst com/craftinginterpreters/lox
+
+    $ com/craftinginterpreters/lox/Expr$$Binary.class: com/craftinginterpreters/lox/Expr.java
         $(tools.javac) com/craftinginterpreters/lox/Expr.java
-        $(tools.javac) com/craftinginterpreters/lox/AstPrinter.java
+
+    $ com/craftinginterpreters/lox/AstPrinter.class: com/craftinginterpreters/lox/Expr$$Binary.class
 
     rules
 }
