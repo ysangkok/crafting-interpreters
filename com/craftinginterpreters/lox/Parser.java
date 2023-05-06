@@ -14,10 +14,24 @@ class Parser {
 
   Expr parse() {
     try {
-      return expression();
+      return ternary();
     } catch (ParseError error) {
       return null;
     }
+  }
+
+  private Expr ternary() {
+    Expr cond = expression();
+    if (match(QUESTION_MARK)) {
+      Token qmark = previous();
+      Expr ifTrue = expression();
+      if (match(COLON)) {
+        Token colon = previous();
+        Expr ifFalse = expression();
+        return new Expr.Ternary(cond, qmark, ifTrue, colon, ifFalse);
+      }
+    }
+    return null;
   }
 
   private Expr expression() {
