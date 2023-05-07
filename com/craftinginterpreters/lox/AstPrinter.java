@@ -8,11 +8,17 @@ class AstPrinter implements Expr.Visitor<String> {
   @Override
   public String visitTernaryExpr(Expr.Ternary expr) {
     StringBuilder b = new StringBuilder();
+    b.append("( ");
     b.append(expr.condition.accept(this));
+    b.append(" ) ");
     b.append(expr.questionMark.lexeme);
+    b.append(" ( ");
     b.append(expr.whenTrue.accept(this));
+    b.append(" ) ");
     b.append(expr.colon.lexeme);
+    b.append(" ( ");
     b.append(expr.whenFalse.accept(this));
+    b.append(" )");
 
     return b.toString();
   }

@@ -14,14 +14,14 @@ class Parser {
 
   Expr parse() {
     try {
-      return ternary();
+      return expression();
     } catch (ParseError error) {
       return null;
     }
   }
 
   private Expr ternary() {
-    Expr expr = expression();
+    Expr expr = equality();
     while (match(QUESTION_MARK)) {
       Token qmark = previous();
       Expr ifTrue = expression();
@@ -37,7 +37,7 @@ class Parser {
   }
 
   private Expr expression() {
-    return equality();
+    return ternary();
   }
 
   private Expr equality() {
