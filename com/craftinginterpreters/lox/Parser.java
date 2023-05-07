@@ -21,17 +21,19 @@ class Parser {
   }
 
   private Expr ternary() {
-    Expr cond = expression();
-    if (match(QUESTION_MARK)) {
+    Expr expr = expression();
+    while (match(QUESTION_MARK)) {
       Token qmark = previous();
       Expr ifTrue = expression();
       if (match(COLON)) {
         Token colon = previous();
         Expr ifFalse = expression();
-        return new Expr.Ternary(cond, qmark, ifTrue, colon, ifFalse);
+        expr = new Expr.Ternary(expr, qmark, ifTrue, colon, ifFalse);
+      } else {
+        throw error(peek(), "Expected colon here since we have seen a question mark initiating a ternary expression.");
       }
     }
-    return null;
+    return expr;
   }
 
   private Expr expression() {
