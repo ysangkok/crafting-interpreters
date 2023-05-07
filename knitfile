@@ -9,7 +9,9 @@ return b{
 
     $ com/craftinginterpreters/lox/Token.class: com/craftinginterpreters/lox/TokenType.class
 
-    $ com/craftinginterpreters/lox/Lox.class: com/craftinginterpreters/lox/TokenType.class com/craftinginterpreters/lox/Scanner.class com/craftinginterpreters/lox/Token.class com/craftinginterpreters/lox/Parser.class
+    $ com/craftinginterpreters/lox/Interpreter.class: com/craftinginterpreters/lox/RuntimeError.class
+
+    $ com/craftinginterpreters/lox/Lox.class: com/craftinginterpreters/lox/TokenType.class com/craftinginterpreters/lox/Scanner.class com/craftinginterpreters/lox/Token.class com/craftinginterpreters/lox/Parser.class com/craftinginterpreters/lox/Interpreter.class
 
     -- code gen
 
