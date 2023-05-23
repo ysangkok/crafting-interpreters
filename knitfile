@@ -4,14 +4,15 @@ local tools = java.toolchain("")
 local rules = java.rules(tools)
 
 return b{
+    $ com/craftinginterpreters/lox/Lox.class: com/craftinginterpreters/lox/TokenType.class com/craftinginterpreters/lox/Scanner.class com/craftinginterpreters/lox/Token.class com/craftinginterpreters/lox/Parser.class com/craftinginterpreters/lox/Interpreter.class
 
     $ com/craftinginterpreters/lox/Scanner.class: com/craftinginterpreters/lox/TokenType.class com/craftinginterpreters/lox/Parser.class
 
     $ com/craftinginterpreters/lox/Token.class: com/craftinginterpreters/lox/TokenType.class
 
-    $ com/craftinginterpreters/lox/Interpreter.class: com/craftinginterpreters/lox/RuntimeError.class com/craftinginterpreters/lox/Environment.class
+    $ com/craftinginterpreters/lox/Interpreter.class: com/craftinginterpreters/lox/RuntimeError.class com/craftinginterpreters/lox/Environment.class com/craftinginterpreters/lox/Return.class com/craftinginterpreters/lox/LoxFunction.class
 
-    $ com/craftinginterpreters/lox/Lox.class: com/craftinginterpreters/lox/TokenType.class com/craftinginterpreters/lox/Scanner.class com/craftinginterpreters/lox/Token.class com/craftinginterpreters/lox/Parser.class com/craftinginterpreters/lox/Interpreter.class
+    $ com/craftinginterpreters/lox/LoxFunction.class: com/craftinginterpreters/lox/Return.class
 
     -- code gen
 
@@ -24,14 +25,14 @@ return b{
     $ com/craftinginterpreters/lox/Expr$$Binary.class: com/craftinginterpreters/lox/Expr.java
         $(tools.javac) com/craftinginterpreters/lox/Expr.java
 
-    $ com/craftinginterpreters/lox/Stmt$$Binary.class: com/craftinginterpreters/lox/Stmt.java
+    $ com/craftinginterpreters/lox/Stmt$$Var.class: com/craftinginterpreters/lox/Stmt.java
         $(tools.javac) com/craftinginterpreters/lox/Stmt.java
 
     $ com/craftinginterpreters/lox/AstPrinter.class: com/craftinginterpreters/lox/Expr$$Binary.class
 
     -- parser
 
-    $ com/craftinginterpreters/lox/Parser.class: com/craftinginterpreters/lox/TokenType.class com/craftinginterpreters/lox/Token.class com/craftinginterpreters/lox/Expr$$Binary.class com/craftinginterpreters/lox/Stmt$$Binary.class
+    $ com/craftinginterpreters/lox/Parser.class: com/craftinginterpreters/lox/TokenType.class com/craftinginterpreters/lox/Token.class com/craftinginterpreters/lox/Expr$$Binary.class com/craftinginterpreters/lox/Stmt$$Var.class
 
 
     rules
