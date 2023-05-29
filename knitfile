@@ -14,7 +14,7 @@ return b{
 
     $ com/craftinginterpreters/lox/Interpreter.class: com/craftinginterpreters/lox/RuntimeError.class com/craftinginterpreters/lox/Environment.class com/craftinginterpreters/lox/Return.class com/craftinginterpreters/lox/LoxFunction.class
 
-    $ com/craftinginterpreters/lox/LoxFunction.class: com/craftinginterpreters/lox/Return.class
+    $ com/craftinginterpreters/lox/LoxFunction.class: com/craftinginterpreters/lox/Return.class com/craftinginterpreters/lox/Expr$$Binary.class com/craftinginterpreters/lox/Stmt$$Var.class
 
     -- code gen
 

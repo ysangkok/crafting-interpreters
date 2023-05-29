@@ -34,6 +34,12 @@ class Resolver implements Expr.Visitor<Void>, Stmt.Visitor<Void> {
   }
 
   @Override
+  public Void visitLambdaExpr(Expr.Lambda lam) {
+    resolveLambda(lam, FunctionType.FUNCTION);
+    return null;
+  }
+
+  @Override
   public Void visitFunctionStmt(Stmt.Function stmt) {
     declare(stmt.name);
     define(stmt.name);
@@ -153,6 +159,21 @@ class Resolver implements Expr.Visitor<Void>, Stmt.Visitor<Void> {
 
   private void resolve(Expr expr) {
     expr.accept(this);
+  }
+
+  private void resolveLambda(
+      Expr.Lambda function, FunctionType type) {
+    FunctionType enclosingFunction = currentFunction;
+    currentFunction = type;
+
+    beginScope();
+    for (Token param : function.params) {
+      declare(param);
+      define(param);
+    }
+    resolve(function.body);
+    endScope();
+    currentFunction = enclosingFunction;
   }
 
   private void resolveFunction(

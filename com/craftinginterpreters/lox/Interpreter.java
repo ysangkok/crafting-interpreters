@@ -89,7 +89,7 @@ class Interpreter implements Expr.Visitor<Object>,
 
   @Override
   public Void visitFunctionStmt(Stmt.Function stmt) {
-    LoxFunction function = new LoxFunction(stmt, environment);
+    LoxFunction function = LoxFunction.fromStatement(stmt, environment);
     environment.define(stmt.name.lexeme, function);
     return null;
   }
@@ -292,5 +292,11 @@ class Interpreter implements Expr.Visitor<Object>,
     }
 
     return object.toString();
+  }
+
+  @Override
+  public LoxFunction visitLambdaExpr(Expr.Lambda lam) {
+    LoxFunction function = LoxFunction.fromLambda(lam, environment);
+    return function;
   }
 }
