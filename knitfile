@@ -4,7 +4,9 @@ local tools = java.toolchain("")
 local rules = java.rules(tools)
 
 return b{
-    $ com/craftinginterpreters/lox/Lox.class: com/craftinginterpreters/lox/TokenType.class com/craftinginterpreters/lox/Scanner.class com/craftinginterpreters/lox/Token.class com/craftinginterpreters/lox/Parser.class com/craftinginterpreters/lox/Interpreter.class
+    $ com/craftinginterpreters/lox/Lox.class: com/craftinginterpreters/lox/TokenType.class com/craftinginterpreters/lox/Scanner.class com/craftinginterpreters/lox/Token.class com/craftinginterpreters/lox/Parser.class com/craftinginterpreters/lox/Interpreter.class com/craftinginterpreters/lox/Resolver.class
+
+    $ com/craftinginterpreters/lox/Resolver.class: com/craftinginterpreters/lox/Expr$$Binary.class com/craftinginterpreters/lox/Interpreter.class com/craftinginterpreters/lox/Stmt$$Var.class
 
     $ com/craftinginterpreters/lox/Scanner.class: com/craftinginterpreters/lox/TokenType.class com/craftinginterpreters/lox/Parser.class
 
