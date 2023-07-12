@@ -62,12 +62,12 @@ const Token = struct {
 };
 
 fn makeToken(scanner: *Scanner, typ: TokenType) !Token {
-    var token: Token = undefined;
-    token.typ = typ;
-    token.start = scanner.start;
-    token.length = (scanner.current - scanner.start);
-    token.line = scanner.line;
-    return token;
+    return Token{
+        .typ = typ,
+        .start = scanner.start,
+        .length = (scanner.current - scanner.start),
+        .line = scanner.line,
+    };
 }
 
 fn advance(scanner: *Scanner, buf: []const u8) u8 {
@@ -237,12 +237,14 @@ const ValueTag = enum {
     number,
     boolean,
     nil,
+    string,
 };
 
 const Value = union(ValueTag) {
     number: f64,
     boolean: bool,
     nil: void,
+    string: []u8,
 };
 
 fn numberP(currentChunk: *Chunk, parser: *Parser, buf: []const u8) void {
@@ -264,16 +266,16 @@ fn emitConstant(currentChunk: *Chunk, val: Value) void {
     };
 }
 
-fn grouping(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) void {
-    expression(currentChunk, parser, scanner, buf);
+fn grouping(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) void {
+    expression(gpa, currentChunk, parser, scanner, buf);
     consumeP(parser, scanner, buf, TokenType.RIGHT_PAREN, "Expect ')' after expression.");
 }
 
-fn unary(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) void {
+fn unary(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) void {
     const operatorType = parser.previous.typ;
 
     // Compile the operand.
-    parsePrecedence(currentChunk, parser, scanner, buf, getPrecedence(operatorType).next());
+    parsePrecedence(gpa, currentChunk, parser, scanner, buf, getPrecedence(operatorType).next());
 
     // Emit the operator instruction.
     switch (operatorType) {
@@ -305,8 +307,8 @@ const Prec = enum {
     }
 };
 
-fn expression(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) void {
-    parsePrecedence(currentChunk, parser, scanner, buf, Prec.ASSIGNMENT);
+fn expression(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) void {
+    parsePrecedence(gpa, currentChunk, parser, scanner, buf, Prec.ASSIGNMENT);
 }
 
 fn getPrecedence(tokenType: TokenType) Prec {
@@ -336,9 +338,9 @@ fn getPrecedence(tokenType: TokenType) Prec {
     };
 }
 
-fn binary(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) !void {
+fn binary(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) !void {
     const operatorType: TokenType = parser.previous.typ;
-    parsePrecedence(currentChunk, parser, scanner, buf, getPrecedence(operatorType).next());
+    parsePrecedence(gpa, currentChunk, parser, scanner, buf, getPrecedence(operatorType).next());
 
     switch (operatorType) {
         TokenType.BANG_EQUAL => try currentChunk.data.appendSlice(&[_]u8{ @intFromEnum(Op.EQUAL), @intFromEnum(Op.NOT) }),
@@ -355,12 +357,12 @@ fn binary(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const
     }
 }
 
-fn parsePrecedence(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, precedence: Prec) void {
+fn parsePrecedence(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, precedence: Prec) void {
     advanceP(parser, scanner, buf);
-    prefix(currentChunk, parser, scanner, buf, parser.previous.typ);
+    prefix(gpa, currentChunk, parser, scanner, buf, parser.previous.typ);
     while (@intFromEnum(precedence) <= @intFromEnum(getPrecedence(parser.current.typ))) {
         advanceP(parser, scanner, buf);
-        infix(currentChunk, parser, scanner, buf, parser.previous.typ);
+        infix(gpa, currentChunk, parser, scanner, buf, parser.previous.typ);
     }
 }
 
@@ -379,16 +381,25 @@ fn literalP(currentChunk: *Chunk, parser: *Parser) void {
     }
 }
 
+fn stringP(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, buf: []const u8) void {
+    const dst = gpa.alloc(u8, parser.previous.length - 2) catch {
+        @panic("oom");
+    };
+    std.mem.copy(u8, dst, buf[parser.previous.start + 1 .. parser.previous.start + 1 + parser.previous.length - 2]);
+    emitConstant(currentChunk, Value{ .string = dst });
+}
+
 // from https://github.com/jwmerrill/zig-lox/blob/main/src/compiler.zig
-fn prefix(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, tokenType: TokenType) void {
+fn prefix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, tokenType: TokenType) void {
     switch (tokenType) {
         // Single-character tokens.
-        .LEFT_PAREN => grouping(currentChunk, parser, scanner, buf),
-        .MINUS, .BANG => unary(currentChunk, parser, scanner, buf),
+        .LEFT_PAREN => grouping(gpa, currentChunk, parser, scanner, buf),
+        .MINUS, .BANG => unary(gpa, currentChunk, parser, scanner, buf),
         //.RIGHTPAREN, .LEFTBRACE, .RIGHTBRACE, .COMMA, .DOT => try self.prefixError(),
         //.Plus, .Semicolon, .Slash, .Star => try self.prefixError(),
         .NUMBER => numberP(currentChunk, parser, buf),
         .FALSE, .NIL, .TRUE => literalP(currentChunk, parser),
+        .STRING => stringP(gpa, currentChunk, parser, buf),
         else => panicToken(tokenType),
 
         //// One or two character tokens.
@@ -398,7 +409,6 @@ fn prefix(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const
 
         //// Literals.
         //.Identifier => try self.variable(canAssign),
-        //.String => try self.string(),
 
         //// Keywords.
         //.Nil, .True, .False => try self.literal(),
@@ -410,17 +420,17 @@ fn prefix(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const
 }
 
 fn panicToken(tokenType: TokenType) noreturn {
-    var b: [256]u8 = undefined;
+    var b: [256]u8 = [1]u8{0} ** 256;
     const b2 = std.fmt.bufPrint(&b, "can't handle: {s}", .{@tagName(tokenType)}) catch {
         @panic("bufPrint failed");
     };
     @panic(b2);
 }
 
-fn infix(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, tokenType: TokenType) void {
+fn infix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, tokenType: TokenType) void {
     switch (tokenType) {
         // Single-character tokens.
-        .MINUS, .PLUS, .SLASH, .STAR, .BANG_EQUAL, .EQUAL_EQUAL, .GREATER, .GREATER_EQUAL, .LESS, .LESS_EQUAL => binary(currentChunk, parser, scanner, buf) catch {
+        .MINUS, .PLUS, .SLASH, .STAR, .BANG_EQUAL, .EQUAL_EQUAL, .GREATER, .GREATER_EQUAL, .LESS, .LESS_EQUAL => binary(gpa, currentChunk, parser, scanner, buf) catch {
             @panic("binary failed");
         },
         else => panicToken(tokenType),
@@ -494,9 +504,8 @@ pub fn main() !void {
     var bw = std.io.bufferedWriter(stdout_file);
     //const stdout = bw.writer();
 
-    var buffer: [32000]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buffer);
-    const gpa = fba.allocator();
+    var gen = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = gen.allocator();
 
     var file = try std.fs.cwd().openFile("foo.txt", .{});
     defer file.close();
@@ -507,7 +516,7 @@ pub fn main() !void {
     var compilingChunk = Chunk{ .data = std.ArrayList(u8).init(gpa), .constants = std.ArrayList(Value).init(gpa), .line = 1 };
     var parser: Parser = undefined;
     advanceP(&parser, &scanner, file_buffer);
-    expression(&compilingChunk, &parser, &scanner, file_buffer);
+    expression(gpa, &compilingChunk, &parser, &scanner, file_buffer);
     try compilingChunk.data.append(@intFromEnum(Op.RETURN));
     consumeP(&parser, &scanner, file_buffer, TokenType.EOF, "Expect end of expression.");
 
@@ -527,7 +536,7 @@ pub fn main() !void {
         .stack = undefined,
         .stackTop = 0,
     };
-    try runChunk(&compilingChunk, &vm);
+    try runChunk(gpa, &compilingChunk, &vm);
     vm.stackTop = 0;
     std.os.exit(0);
 
@@ -614,12 +623,20 @@ fn get_boolean(val: Value) !bool {
     }
 }
 
+fn get_string(val: Value) ![]const u8 {
+    switch (val) {
+        .string => |str| return str,
+        else => @panic("not a string"),
+    }
+}
+
 fn valuesEqual(a: Value, b: Value) bool {
     if (@intFromEnum(a) != @intFromEnum(b)) return false;
     switch (a) {
         .boolean => |boo| return boo == b.boolean,
         .nil => return true,
         .number => |num| return num == b.number,
+        .string => |str| return std.mem.eql(u8, str, b.string),
     }
 }
 
@@ -646,10 +663,11 @@ fn showVal(val: Value) []const u8 {
             };
             return &a;
         },
+        .string => |str| return str,
     }
 }
 
-fn runChunk(chunk: *Chunk, vm: *VM) !void {
+fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
     const stdout_file = std.io.getStdOut().writer();
     var bw = std.io.bufferedWriter(stdout_file);
     const stdout = bw.writer();
@@ -737,11 +755,25 @@ fn runChunk(chunk: *Chunk, vm: *VM) !void {
             },
             .ADD => {
                 try stdout.print("add: original stackTop={d}\n", .{vm.stackTop});
-                const b = try get_number(vm.stack[vm.stackTop - 0]);
-                const a = try get_number(vm.stack[vm.stackTop - 1]);
-                vm.stackTop -= 1;
-                vm.stack[vm.stackTop] = Value{ .number = a + b };
-                try stdout.print("add: a={d} b={d} res={s}, new reduced stackTop={d}\n", .{ a, b, showVal(vm.stack[vm.stackTop]), vm.stackTop });
+                const b = vm.stack[vm.stackTop - 0];
+                const a = vm.stack[vm.stackTop - 1];
+                switch (b) {
+                    .number => |bn| {
+                        const an = try get_number(a);
+                        vm.stackTop -= 1;
+                        vm.stack[vm.stackTop] = Value{ .number = an + bn };
+                        try stdout.print("add: a={d} b={d} res={s}, new reduced stackTop={d}\n", .{ an, bn, showVal(vm.stack[vm.stackTop]), vm.stackTop });
+                    },
+                    .string => |bs| {
+                        const as = try get_string(a);
+                        vm.stackTop -= 1;
+                        var new = try concatAndReturnBuffer(gpa, as, bs);
+                        vm.stack[vm.stackTop] = Value{ .string = new };
+                    },
+                    else => {
+                        @panic("invalid types for + operator");
+                    },
+                }
             },
         }
     }
@@ -749,6 +781,13 @@ fn runChunk(chunk: *Chunk, vm: *VM) !void {
         @panic("expected return");
     }
     try bw.flush();
+}
+
+fn concatAndReturnBuffer(allocator: std.mem.Allocator, one: []const u8, two: []const u8) ![]u8 {
+    var b = try allocator.alloc(u8, one.len + two.len);
+    std.mem.copy(u8, b, one);
+    std.mem.copy(u8, b[one.len..], two);
+    return b;
 }
 
 test "op length" {
