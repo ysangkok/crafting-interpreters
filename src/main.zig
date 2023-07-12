@@ -233,14 +233,26 @@ fn consumeP(parser: *Parser, scanner: *Scanner, buf: []const u8, typ: TokenType,
     @panic(message);
 }
 
+const ValueTag = enum {
+    number,
+    boolean,
+    nil,
+};
+
+const Value = union(ValueTag) {
+    number: f64,
+    boolean: bool,
+    nil: void,
+};
+
 fn numberP(currentChunk: *Chunk, parser: *Parser, buf: []const u8) void {
     const value = std.fmt.parseFloat(f64, buf[parser.previous.start .. parser.previous.start + parser.previous.length]) catch {
         @panic("invalid");
     };
-    emitConstant(currentChunk, value);
+    emitConstant(currentChunk, Value{ .number = value });
 }
 
-fn emitConstant(currentChunk: *Chunk, val: f64) void {
+fn emitConstant(currentChunk: *Chunk, val: Value) void {
     currentChunk.constants.append(val) catch {
         @panic("couldn't append");
     };
@@ -265,6 +277,9 @@ fn unary(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const 
 
     // Emit the operator instruction.
     switch (operatorType) {
+        TokenType.BANG => currentChunk.data.append(@intFromEnum(Op.NOT)) catch {
+            @panic("error in bang");
+        },
         TokenType.MINUS => currentChunk.data.append(@intFromEnum(Op.NEGATE)) catch {
             @panic("error in minus");
         },
@@ -321,23 +336,21 @@ fn getPrecedence(tokenType: TokenType) Prec {
     };
 }
 
-fn binary(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) void {
+fn binary(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) !void {
     const operatorType: TokenType = parser.previous.typ;
     parsePrecedence(currentChunk, parser, scanner, buf, getPrecedence(operatorType).next());
 
     switch (operatorType) {
-        TokenType.PLUS => currentChunk.data.append(@intFromEnum(Op.ADD)) catch {
-            @panic("can't append");
-        },
-        TokenType.MINUS => currentChunk.data.append(@intFromEnum(Op.SUBTRACT)) catch {
-            @panic("can't append");
-        },
-        TokenType.STAR => currentChunk.data.append(@intFromEnum(Op.MULTIPLY)) catch {
-            @panic("can't append");
-        },
-        TokenType.SLASH => currentChunk.data.append(@intFromEnum(Op.DIVIDE)) catch {
-            @panic("can't append");
-        },
+        TokenType.BANG_EQUAL => try currentChunk.data.appendSlice(&[_]u8{ @intFromEnum(Op.EQUAL), @intFromEnum(Op.NOT) }),
+        TokenType.EQUAL_EQUAL => try currentChunk.data.append(@intFromEnum(Op.EQUAL)),
+        TokenType.GREATER => try currentChunk.data.append(@intFromEnum(Op.GREATER)),
+        TokenType.GREATER_EQUAL => try currentChunk.data.appendSlice(&[_]u8{ @intFromEnum(Op.LESS), @intFromEnum(Op.NOT) }),
+        TokenType.LESS => try currentChunk.data.append(@intFromEnum(Op.LESS)),
+        TokenType.LESS_EQUAL => try currentChunk.data.appendSlice(&[_]u8{ @intFromEnum(Op.GREATER), @intFromEnum(Op.NOT) }),
+        TokenType.PLUS => try currentChunk.data.append(@intFromEnum(Op.ADD)),
+        TokenType.MINUS => try currentChunk.data.append(@intFromEnum(Op.SUBTRACT)),
+        TokenType.STAR => try currentChunk.data.append(@intFromEnum(Op.MULTIPLY)),
+        TokenType.SLASH => try currentChunk.data.append(@intFromEnum(Op.DIVIDE)),
         else => unreachable,
     }
 }
@@ -351,15 +364,31 @@ fn parsePrecedence(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf
     }
 }
 
+fn literalP(currentChunk: *Chunk, parser: *Parser) void {
+    switch (parser.previous.typ) {
+        .FALSE => currentChunk.data.append(@intFromEnum(Op.FALSE)) catch {
+            @panic("FALSE");
+        },
+        .NIL => currentChunk.data.append(@intFromEnum(Op.NIL)) catch {
+            @panic("NIL");
+        },
+        .TRUE => currentChunk.data.append(@intFromEnum(Op.TRUE)) catch {
+            @panic("TRUE");
+        },
+        else => unreachable,
+    }
+}
+
 // from https://github.com/jwmerrill/zig-lox/blob/main/src/compiler.zig
 fn prefix(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, tokenType: TokenType) void {
     switch (tokenType) {
         // Single-character tokens.
         .LEFT_PAREN => grouping(currentChunk, parser, scanner, buf),
-        .MINUS => unary(currentChunk, parser, scanner, buf),
+        .MINUS, .BANG => unary(currentChunk, parser, scanner, buf),
         //.RIGHTPAREN, .LEFTBRACE, .RIGHTBRACE, .COMMA, .DOT => try self.prefixError(),
         //.Plus, .Semicolon, .Slash, .Star => try self.prefixError(),
         .NUMBER => numberP(currentChunk, parser, buf),
+        .FALSE, .NIL, .TRUE => literalP(currentChunk, parser),
         else => panicToken(tokenType),
 
         //// One or two character tokens.
@@ -391,7 +420,9 @@ fn panicToken(tokenType: TokenType) noreturn {
 fn infix(currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, tokenType: TokenType) void {
     switch (tokenType) {
         // Single-character tokens.
-        .MINUS, .PLUS, .SLASH, .STAR => binary(currentChunk, parser, scanner, buf),
+        .MINUS, .PLUS, .SLASH, .STAR, .BANG_EQUAL, .EQUAL_EQUAL, .GREATER, .GREATER_EQUAL, .LESS, .LESS_EQUAL => binary(currentChunk, parser, scanner, buf) catch {
+            @panic("binary failed");
+        },
         else => panicToken(tokenType),
         //.LeftParen => try self.call(),
         //.Dot => try self.dot(canAssign),
@@ -461,7 +492,7 @@ fn disassembleChunk(chunks: *std.MultiArrayList(Chunk)) !void {
 pub fn main() !void {
     const stdout_file = std.io.getStdOut().writer();
     var bw = std.io.bufferedWriter(stdout_file);
-    const stdout = bw.writer();
+    //const stdout = bw.writer();
 
     var buffer: [32000]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buffer);
@@ -473,7 +504,7 @@ pub fn main() !void {
     const file_buffer = try file.readToEndAlloc(gpa, 1024);
 
     var scanner = Scanner{ .start = 0, .current = 0, .line = 1 };
-    var compilingChunk = Chunk{ .data = std.ArrayList(u8).init(gpa), .constants = std.ArrayList(f64).init(gpa), .line = 1 };
+    var compilingChunk = Chunk{ .data = std.ArrayList(u8).init(gpa), .constants = std.ArrayList(Value).init(gpa), .line = 1 };
     var parser: Parser = undefined;
     advanceP(&parser, &scanner, file_buffer);
     expression(&compilingChunk, &parser, &scanner, file_buffer);
@@ -500,63 +531,63 @@ pub fn main() !void {
     vm.stackTop = 0;
     std.os.exit(0);
 
-    var chunks = try demoChunks(gpa);
+    //var chunks = try demoChunks(gpa);
 
-    const data = chunks.items(.data);
-    for (data, 0..) |op, idx| {
-        const openum = @enumFromInt(Op, op.items[0]);
-        //try stdout.print("processing idx idx={d} data.len={d} {s} op.items.len={d}\n", .{ idx, data.len, @tagName(openum), op.items.len });
-        //try bw.flush();
-        switch (openum) {
-            .CONSTANT => {
-                const chunkConstants = chunks.items(.constants)[idx].items;
-                vm.stackTop += 1;
-                //try stdout.print("{d} {d}\n", .{ op.items[0], op.items[1] });
-                //try bw.flush();
-                vm.stack[vm.stackTop] = chunkConstants[@as(usize, op.items[1])];
-                try stdout.print("constant: {d}, stored at stackTop={d}\n", .{ vm.stack[vm.stackTop], vm.stackTop });
-            },
-            .MULTIPLY => {
-                const b = vm.stack[vm.stackTop - 0];
-                const a = vm.stack[vm.stackTop - 1];
-                vm.stackTop -= 1;
-                vm.stack[vm.stackTop] = a * b;
-                try stdout.print("mult: a={d} b={d} res={d}, new reduced stackTop={d} \n", .{ a, b, vm.stack[vm.stackTop], vm.stackTop });
-            },
-            .DIVIDE => {
-                const b = vm.stack[vm.stackTop - 0];
-                const a = vm.stack[vm.stackTop - 1];
-                vm.stackTop -= 1;
-                vm.stack[vm.stackTop] = a / b;
-                try stdout.print("divide: a={d} b={d} res={d}, new reduced stackTop={d} \n", .{ a, b, vm.stack[vm.stackTop], vm.stackTop });
-            },
-            .NEGATE => {
-                const old = vm.stack[vm.stackTop];
-                const res = -old;
-                try stdout.print("negate: old={d} res={d}, stackTop={d} \n", .{ old, res, vm.stackTop });
-                vm.stack[vm.stackTop] = res;
-            },
-            .RETURN => {
-                try stdout.print("return: {d} read from stackTop={d}\n", .{ vm.stack[vm.stackTop], vm.stackTop });
-            },
-            .SUBTRACT => {
-                try stdout.print("sub: original stackTop={d}\n", .{vm.stackTop});
-                const b = vm.stack[vm.stackTop - 0];
-                const a = vm.stack[vm.stackTop - 1];
-                vm.stackTop -= 1;
-                vm.stack[vm.stackTop] = a - b;
-                try stdout.print("sub: a={d} b={d} res={d}, new reduced stackTop={d}\n", .{ a, b, vm.stack[vm.stackTop], vm.stackTop });
-            },
-            .ADD => {
-                try stdout.print("add: original stackTop={d}\n", .{vm.stackTop});
-                const b = vm.stack[vm.stackTop - 0];
-                const a = vm.stack[vm.stackTop - 1];
-                vm.stackTop -= 1;
-                vm.stack[vm.stackTop] = a + b;
-                try stdout.print("add: a={d} b={d} res={d}, new reduced stackTop={d}\n", .{ a, b, vm.stack[vm.stackTop], vm.stackTop });
-            },
-        }
-    }
+    //const data = chunks.items(.data);
+    //for (data, 0..) |op, idx| {
+    //    const openum = @enumFromInt(Op, op.items[0]);
+    //    //try stdout.print("processing idx idx={d} data.len={d} {s} op.items.len={d}\n", .{ idx, data.len, @tagName(openum), op.items.len });
+    //    //try bw.flush();
+    //    switch (openum) {
+    //        .CONSTANT => {
+    //            const chunkConstants = chunks.items(.constants)[idx].items;
+    //            vm.stackTop += 1;
+    //            //try stdout.print("{d} {d}\n", .{ op.items[0], op.items[1] });
+    //            //try bw.flush();
+    //            vm.stack[vm.stackTop] = chunkConstants[@as(usize, op.items[1])];
+    //            try stdout.print("constant: {d}, stored at stackTop={d}\n", .{ vm.stack[vm.stackTop], vm.stackTop });
+    //        },
+    //        .MULTIPLY => {
+    //            const b = vm.stack[vm.stackTop - 0];
+    //            const a = vm.stack[vm.stackTop - 1];
+    //            vm.stackTop -= 1;
+    //            vm.stack[vm.stackTop] = a * b;
+    //            try stdout.print("mult: a={d} b={d} res={d}, new reduced stackTop={d} \n", .{ a, b, vm.stack[vm.stackTop], vm.stackTop });
+    //        },
+    //        .DIVIDE => {
+    //            const b = vm.stack[vm.stackTop - 0];
+    //            const a = vm.stack[vm.stackTop - 1];
+    //            vm.stackTop -= 1;
+    //            vm.stack[vm.stackTop] = a / b;
+    //            try stdout.print("divide: a={d} b={d} res={d}, new reduced stackTop={d} \n", .{ a, b, vm.stack[vm.stackTop], vm.stackTop });
+    //        },
+    //        .NEGATE => {
+    //            const old = vm.stack[vm.stackTop];
+    //            const res = -old;
+    //            try stdout.print("negate: old={d} res={d}, stackTop={d} \n", .{ old, res, vm.stackTop });
+    //            vm.stack[vm.stackTop] = res;
+    //        },
+    //        .RETURN => {
+    //            try stdout.print("return: {d} read from stackTop={d}\n", .{ vm.stack[vm.stackTop], vm.stackTop });
+    //        },
+    //        .SUBTRACT => {
+    //            try stdout.print("sub: original stackTop={d}\n", .{vm.stackTop});
+    //            const b = vm.stack[vm.stackTop - 0];
+    //            const a = vm.stack[vm.stackTop - 1];
+    //            vm.stackTop -= 1;
+    //            vm.stack[vm.stackTop] = a - b;
+    //            try stdout.print("sub: a={d} b={d} res={d}, new reduced stackTop={d}\n", .{ a, b, vm.stack[vm.stackTop], vm.stackTop });
+    //        },
+    //        .ADD => {
+    //            try stdout.print("add: original stackTop={d}\n", .{vm.stackTop});
+    //            const b = vm.stack[vm.stackTop - 0];
+    //            const a = vm.stack[vm.stackTop - 1];
+    //            vm.stackTop -= 1;
+    //            vm.stack[vm.stackTop] = a + b;
+    //            try stdout.print("add: a={d} b={d} res={d}, new reduced stackTop={d}\n", .{ a, b, vm.stack[vm.stackTop], vm.stackTop });
+    //        },
+    //    }
+    //}
 
     try bw.flush();
 }
@@ -566,8 +597,57 @@ pub fn main() !void {
 
 const VM = struct {
     stackTop: usize,
-    stack: [256]f64,
+    stack: [256]Value,
 };
+
+fn get_number(val: Value) !f64 {
+    switch (val) {
+        .number => |num| return num,
+        else => @panic("not a number"),
+    }
+}
+
+fn get_boolean(val: Value) !bool {
+    switch (val) {
+        .boolean => |boo| return boo,
+        else => @panic("not a boolean"),
+    }
+}
+
+fn valuesEqual(a: Value, b: Value) bool {
+    if (@intFromEnum(a) != @intFromEnum(b)) return false;
+    switch (a) {
+        .boolean => |boo| return boo == b.boolean,
+        .nil => return true,
+        .number => |num| return num == b.number,
+    }
+}
+
+fn isFalsey(value: Value) bool {
+    switch (value) {
+        .nil => return true,
+        .boolean => |boo| return !boo,
+        else => return false,
+    }
+}
+
+fn showVal(val: Value) []const u8 {
+    switch (val) {
+        .nil => return "nil",
+        .boolean => |b| if (b) {
+            return "true";
+        } else {
+            return "false";
+        },
+        .number => |n| {
+            var a: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+            _ = std.fmt.bufPrint(&a, "{d}", .{n}) catch {
+                @panic("lol");
+            };
+            return &a;
+        },
+    }
+}
 
 fn runChunk(chunk: *Chunk, vm: *VM) !void {
     const stdout_file = std.io.getStdOut().writer();
@@ -584,50 +664,84 @@ fn runChunk(chunk: *Chunk, vm: *VM) !void {
         ip += 1;
         lst = op;
         switch (op) {
+            .NIL => {
+                vm.stackTop += 1;
+                vm.stack[vm.stackTop] = Value{ .nil = {} };
+            },
+            .TRUE => {
+                vm.stackTop += 1;
+                vm.stack[vm.stackTop] = Value{ .boolean = true };
+            },
+            .FALSE => {
+                vm.stackTop += 1;
+                vm.stack[vm.stackTop] = Value{ .boolean = false };
+            },
+            .EQUAL => {
+                const b = vm.stack[vm.stackTop - 0];
+                const a = vm.stack[vm.stackTop - 1];
+                vm.stackTop -= 1;
+                vm.stack[vm.stackTop] = Value{ .boolean = valuesEqual(a, b) };
+            },
+            .GREATER => {
+                const b = try get_number(vm.stack[vm.stackTop - 0]);
+                const a = try get_number(vm.stack[vm.stackTop - 1]);
+                vm.stackTop -= 1;
+                vm.stack[vm.stackTop] = Value{ .boolean = a > b };
+            },
+            .LESS => {
+                const b = try get_number(vm.stack[vm.stackTop - 0]);
+                const a = try get_number(vm.stack[vm.stackTop - 1]);
+                vm.stackTop -= 1;
+                vm.stack[vm.stackTop] = Value{ .boolean = a < b };
+            },
+            .NOT => {
+                const b = vm.stack[vm.stackTop];
+                vm.stack[vm.stackTop] = Value{ .boolean = isFalsey(b) };
+            },
             .CONSTANT => {
                 vm.stackTop += 1;
                 vm.stack[vm.stackTop] = chunk.constants.items[@as(usize, chunk.data.items[ip])];
                 ip += 1;
-                try stdout.print("constant: {d}, stored at stackTop={d}\n", .{ vm.stack[vm.stackTop], vm.stackTop });
+                try stdout.print("constant: {s}, stored at stackTop={d}\n", .{ showVal(vm.stack[vm.stackTop]), vm.stackTop });
             },
             .MULTIPLY => {
-                const b = vm.stack[vm.stackTop - 0];
-                const a = vm.stack[vm.stackTop - 1];
+                const b = try get_number(vm.stack[vm.stackTop - 0]);
+                const a = try get_number(vm.stack[vm.stackTop - 1]);
                 vm.stackTop -= 1;
-                vm.stack[vm.stackTop] = a * b;
-                try stdout.print("mult: a={d} b={d} res={d}, new reduced stackTop={d} \n", .{ a, b, vm.stack[vm.stackTop], vm.stackTop });
+                vm.stack[vm.stackTop] = Value{ .number = a * b };
+                try stdout.print("mult: a={d} b={d} res={s}, new reduced stackTop={d} \n", .{ a, b, showVal(vm.stack[vm.stackTop]), vm.stackTop });
             },
             .DIVIDE => {
-                const b = vm.stack[vm.stackTop - 0];
-                const a = vm.stack[vm.stackTop - 1];
+                const b = try get_number(vm.stack[vm.stackTop - 0]);
+                const a = try get_number(vm.stack[vm.stackTop - 1]);
                 vm.stackTop -= 1;
-                vm.stack[vm.stackTop] = a / b;
-                try stdout.print("divide: a={d} b={d} res={d}, new reduced stackTop={d} \n", .{ a, b, vm.stack[vm.stackTop], vm.stackTop });
+                vm.stack[vm.stackTop] = Value{ .number = a / b };
+                try stdout.print("divide: a={d} b={d} res={s}, new reduced stackTop={d} \n", .{ a, b, showVal(vm.stack[vm.stackTop]), vm.stackTop });
             },
             .NEGATE => {
-                const old = vm.stack[vm.stackTop];
+                const old = try get_number(vm.stack[vm.stackTop]);
                 const res = -old;
                 try stdout.print("negate: old={d} res={d}, stackTop={d} \n", .{ old, res, vm.stackTop });
-                vm.stack[vm.stackTop] = res;
+                vm.stack[vm.stackTop] = Value{ .number = res };
             },
             .RETURN => {
-                try stdout.print("return: {d} read from stackTop={d}\n", .{ vm.stack[vm.stackTop], vm.stackTop });
+                try stdout.print("return: {s} read from stackTop={d}\n", .{ showVal(vm.stack[vm.stackTop]), vm.stackTop });
             },
             .SUBTRACT => {
                 try stdout.print("sub: original stackTop={d}\n", .{vm.stackTop});
-                const b = vm.stack[vm.stackTop - 0];
-                const a = vm.stack[vm.stackTop - 1];
+                const b = try get_number(vm.stack[vm.stackTop - 0]);
+                const a = try get_number(vm.stack[vm.stackTop - 1]);
                 vm.stackTop -= 1;
-                vm.stack[vm.stackTop] = a - b;
-                try stdout.print("sub: a={d} b={d} res={d}, new reduced stackTop={d}\n", .{ a, b, vm.stack[vm.stackTop], vm.stackTop });
+                vm.stack[vm.stackTop] = Value{ .number = a - b };
+                try stdout.print("sub: a={d} b={d} res={d}, new reduced stackTop={d}\n", .{ a, b, showVal(vm.stack[vm.stackTop]), vm.stackTop });
             },
             .ADD => {
                 try stdout.print("add: original stackTop={d}\n", .{vm.stackTop});
-                const b = vm.stack[vm.stackTop - 0];
-                const a = vm.stack[vm.stackTop - 1];
+                const b = try get_number(vm.stack[vm.stackTop - 0]);
+                const a = try get_number(vm.stack[vm.stackTop - 1]);
                 vm.stackTop -= 1;
-                vm.stack[vm.stackTop] = a + b;
-                try stdout.print("add: a={d} b={d} res={d}, new reduced stackTop={d}\n", .{ a, b, vm.stack[vm.stackTop], vm.stackTop });
+                vm.stack[vm.stackTop] = Value{ .number = a + b };
+                try stdout.print("add: a={d} b={d} res={s}, new reduced stackTop={d}\n", .{ a, b, showVal(vm.stack[vm.stackTop]), vm.stackTop });
             },
         }
     }
@@ -645,7 +759,7 @@ test "op length" {
 
 const Chunk = struct {
     data: std.ArrayList(u8),
-    constants: std.ArrayList(f64),
+    constants: std.ArrayList(Value),
     line: u16,
 };
 
@@ -655,10 +769,17 @@ var fivesix: [1]f64 = .{5.6};
 
 const Op = enum(u8) {
     CONSTANT,
+    NIL,
+    TRUE,
+    FALSE,
+    EQUAL,
+    GREATER,
+    LESS,
     ADD,
     SUBTRACT,
     MULTIPLY,
     DIVIDE,
+    NOT,
     NEGATE,
     RETURN,
 };
