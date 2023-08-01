@@ -1,209 +1,9 @@
 const std = @import("std");
-
-const TokenType = enum {
-    // Single-character tokens.
-    LEFT_PAREN,
-    RIGHT_PAREN,
-    LEFT_BRACE,
-    RIGHT_BRACE,
-    COMMA,
-    DOT,
-    MINUS,
-    PLUS,
-    SEMICOLON,
-    SLASH,
-    STAR,
-    // One or two character tokens.
-    BANG,
-    BANG_EQUAL,
-    EQUAL,
-    EQUAL_EQUAL,
-    GREATER,
-    GREATER_EQUAL,
-    LESS,
-    LESS_EQUAL,
-    // Literals.
-    IDENTIFIER,
-    STRING,
-    NUMBER,
-    // Keywords.
-    AND,
-    CLASS,
-    ELSE,
-    FALSE,
-    FOR,
-    FUN,
-    IF,
-    NIL,
-    OR,
-    PRINT,
-    RETURN,
-    SUPER,
-    THIS,
-    TRUE,
-    VAR,
-    WHILE,
-
-    ERROR,
-    EOF,
-};
-
-const Scanner = struct {
-    start: u16,
-    current: u16,
-    line: u16,
-};
-
-const Token = struct {
-    typ: TokenType,
-    start: u16,
-    length: u16,
-    line: u16,
-};
-
-fn makeToken(scanner: *Scanner, typ: TokenType) !Token {
-    return Token{
-        .typ = typ,
-        .start = scanner.start,
-        .length = (scanner.current - scanner.start),
-        .line = scanner.line,
-    };
-}
-
-fn advance(scanner: *Scanner, buf: []const u8) u8 {
-    scanner.current += 1;
-    return buf[scanner.current - 1];
-}
-
-fn isAtEnd(scanner: *Scanner, buf: []const u8) bool {
-    return scanner.current >= buf.len;
-}
-
-fn match(scanner: *Scanner, buf: []const u8, comptime expected: comptime_int) bool {
-    if (isAtEnd(scanner, buf)) {
-        return false;
-    }
-    if (buf[scanner.current] != expected) return false;
-    scanner.current += 1;
-    return true;
-}
-
-fn peek(scanner: *Scanner, buf: []const u8) u8 {
-    return buf[scanner.current];
-}
-
-fn peekNext(scanner: *Scanner, buf: []const u8) u8 {
-    if (scanner.current + 1 >= buf.len) return 0;
-    return buf[scanner.current + 1];
-}
-
-fn skipWhitespace(scanner: *Scanner, buf: []const u8) void {
-    while (!isAtEnd(scanner, buf)) {
-        var c: u8 = peek(scanner, buf);
-        switch (c) {
-            ' ', '\r', '\t' => _ = advance(scanner, buf),
-            '\n' => {
-                scanner.line += 1;
-                _ = advance(scanner, buf);
-            },
-            '/' => {
-                if (peekNext(scanner, buf) == '/') {
-                    // A comment goes until the end of the line.
-                    while (peek(scanner, buf) != '\n' and !isAtEnd(scanner, buf))
-                        _ = advance(scanner, buf);
-                } else return;
-            },
-            else => return,
-        }
-    }
-}
-
-fn string(scanner: *Scanner, buf: []const u8) !Token {
-    while (peek(scanner, buf) != '"' and !isAtEnd(scanner, buf)) {
-        if (peek(scanner, buf) == '\n') scanner.line += 1;
-        _ = advance(scanner, buf);
-    }
-
-    if (isAtEnd(scanner, buf)) @panic("Unterminated string.");
-
-    // The closing quote.
-    _ = advance(scanner, buf);
-    return try makeToken(scanner, TokenType.STRING);
-}
-
-fn isDigit(c: u8) bool {
-    return c >= '0' and c <= '9';
-}
-
-fn isAlpha(c: u8) bool {
-    return c >= 'a' and c <= 'z' or c >= 'A' and c <= 'A' or c == '_';
-}
-
-fn number(scanner: *Scanner, buf: []const u8) !Token {
-    while (isDigit(peek(scanner, buf))) {
-        _ = advance(scanner, buf);
-    }
-
-    // Look for a fractional part.
-    if (peek(scanner, buf) == '.' and isDigit(peekNext(scanner, buf))) {
-        // Consume the ".".
-        _ = advance(scanner, buf);
-
-        while (isDigit(peek(scanner, buf))) {
-            _ = advance(scanner, buf);
-        }
-    }
-
-    return makeToken(scanner, TokenType.NUMBER);
-}
-
-fn identifier(scanner: *Scanner, buf: []const u8) !Token {
-    while (isAlpha(peek(scanner, buf)) or isDigit(peek(scanner, buf))) _ = advance(scanner, buf);
-    return makeToken(scanner, identifierType(scanner, buf));
-}
-
-fn identifierType(scanner: *Scanner, buf: []const u8) TokenType {
-    return switch (buf[scanner.start]) {
-        'a' => checkKeyword(scanner, buf, 1, "nd", TokenType.AND),
-        'c' => checkKeyword(scanner, buf, 1, "lass", TokenType.CLASS),
-        'e' => checkKeyword(scanner, buf, 1, "lse", TokenType.ELSE),
-        'f' => if (scanner.current - scanner.start > 1)
-            switch (buf[scanner.start + 1]) {
-                'a' => checkKeyword(scanner, buf, 2, "lse", TokenType.FALSE),
-                'o' => checkKeyword(scanner, buf, 2, "r", TokenType.FOR),
-                'u' => checkKeyword(scanner, buf, 2, "n", TokenType.FUN),
-                else => TokenType.IDENTIFIER,
-            }
-        else
-            TokenType.IDENTIFIER,
-        'i' => checkKeyword(scanner, buf, 1, "f", TokenType.IF),
-        'n' => checkKeyword(scanner, buf, 1, "il", TokenType.NIL),
-        'o' => checkKeyword(scanner, buf, 1, "r", TokenType.OR),
-        'p' => checkKeyword(scanner, buf, 1, "rint", TokenType.PRINT),
-        'r' => checkKeyword(scanner, buf, 1, "eturn", TokenType.RETURN),
-        's' => checkKeyword(scanner, buf, 1, "uper", TokenType.SUPER),
-        't' => if (scanner.current - scanner.start > 1)
-            switch (buf[scanner.start + 1]) {
-                'h' => checkKeyword(scanner, buf, 2, "is", TokenType.THIS),
-                'r' => checkKeyword(scanner, buf, 2, "ue", TokenType.TRUE),
-                else => TokenType.IDENTIFIER,
-            }
-        else
-            TokenType.IDENTIFIER,
-        'v' => checkKeyword(scanner, buf, 1, "ar", TokenType.VAR),
-        'w' => checkKeyword(scanner, buf, 1, "hile", TokenType.WHILE),
-        else => TokenType.IDENTIFIER,
-    };
-}
-
-fn checkKeyword(scanner: *Scanner, buf: []const u8, start: u16, rest: []const u8, typ: TokenType) TokenType {
-    const begin = buf[scanner.start + start ..];
-    if (std.mem.startsWith(u8, begin, rest)) {
-        return typ;
-    }
-
-    return TokenType.IDENTIFIER;
-}
+const scannerMod = @import("scanner.zig");
+const Token = scannerMod.Token;
+const Scanner = scannerMod.Scanner;
+const TokenType = scannerMod.TokenType;
+const scanToken = scannerMod.scanToken;
 
 // chapter 15 compiling expressions
 
@@ -212,11 +12,11 @@ const Parser = struct {
     previous: Token,
 };
 
-fn advanceP(parser: *Parser, scanner: *Scanner, buf: []const u8) void {
+fn advanceP(parser: *Parser, scanner: *Scanner) void {
     parser.previous = parser.current;
 
     while (true) {
-        parser.current = scanToken(scanner, buf);
+        parser.current = scanToken(scanner);
         if (parser.current.typ != TokenType.ERROR) {
             break;
         }
@@ -224,9 +24,9 @@ fn advanceP(parser: *Parser, scanner: *Scanner, buf: []const u8) void {
     }
 }
 
-fn consumeP(parser: *Parser, scanner: *Scanner, buf: []const u8, typ: TokenType, message: []const u8) void {
+fn consumeP(parser: *Parser, scanner: *Scanner, typ: TokenType, message: []const u8) void {
     if (parser.current.typ == typ) {
-        advanceP(parser, scanner, buf);
+        advanceP(parser, scanner);
         return;
     }
 
@@ -277,7 +77,7 @@ fn emitConstant(currentChunk: *Chunk, val: Value) void {
 
 fn grouping(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) void {
     expression(gpa, currentChunk, parser, scanner, buf);
-    consumeP(parser, scanner, buf, TokenType.RIGHT_PAREN, "Expect ')' after expression.");
+    consumeP(parser, scanner, TokenType.RIGHT_PAREN, "Expect ')' after expression.");
 }
 
 fn unary(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) void {
@@ -321,7 +121,7 @@ fn expression(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, sca
 }
 
 fn declaration(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) !void {
-    if (matchP(TokenType.VAR, parser, scanner, buf)) {
+    if (matchP(TokenType.VAR, parser, scanner)) {
         try varDeclaration(gpa, currentChunk, parser, scanner, buf);
     } else {
         try statement(gpa, currentChunk, parser, scanner, buf);
@@ -331,18 +131,18 @@ fn declaration(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, sc
 fn varDeclaration(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) !void {
     var global = try parseVariable(gpa, currentChunk, parser, scanner, buf, "Expect variable name.");
 
-    if (matchP(TokenType.EQUAL, parser, scanner, buf)) {
+    if (matchP(TokenType.EQUAL, parser, scanner)) {
         expression(gpa, currentChunk, parser, scanner, buf);
     } else {
         try currentChunk.data.append(@intFromEnum(Op.NIL));
     }
-    consumeP(parser, scanner, buf, TokenType.SEMICOLON, "Expect ';' after variable declaration.");
+    consumeP(parser, scanner, TokenType.SEMICOLON, "Expect ';' after variable declaration.");
 
     try defineVariable(global, currentChunk);
 }
 
 fn parseVariable(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, errorMessage: []const u8) !usize {
-    consumeP(parser, scanner, buf, TokenType.IDENTIFIER, errorMessage);
+    consumeP(parser, scanner, TokenType.IDENTIFIER, errorMessage);
     return try identifierConstant(gpa, parser.previous, currentChunk, buf);
 }
 
@@ -363,14 +163,14 @@ fn check(typ: TokenType, parser: *Parser) bool {
     return parser.current.typ == typ;
 }
 
-fn matchP(typ: TokenType, parser: *Parser, scanner: *Scanner, buf: []const u8) bool {
+fn matchP(typ: TokenType, parser: *Parser, scanner: *Scanner) bool {
     if (!check(typ, parser)) return false;
-    advanceP(parser, scanner, buf);
+    advanceP(parser, scanner);
     return true;
 }
 
 fn statement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) !void {
-    if (matchP(TokenType.PRINT, parser, scanner, buf)) {
+    if (matchP(TokenType.PRINT, parser, scanner)) {
         //std.debug.print("print\n", .{});
         try printStatement(gpa, currentChunk, parser, scanner, buf);
     } else {
@@ -380,13 +180,13 @@ fn statement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scan
 
 fn expressionStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) !void {
     expression(gpa, currentChunk, parser, scanner, buf);
-    consumeP(parser, scanner, buf, TokenType.SEMICOLON, "Expect ';' after expression.");
+    consumeP(parser, scanner, TokenType.SEMICOLON, "Expect ';' after expression.");
     try currentChunk.data.append(@intFromEnum(Op.POP));
 }
 
 fn printStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) !void {
     expression(gpa, currentChunk, parser, scanner, buf);
-    consumeP(parser, scanner, buf, TokenType.SEMICOLON, "Expect ';' after value.");
+    consumeP(parser, scanner, TokenType.SEMICOLON, "Expect ';' after value.");
     try currentChunk.data.append(@intFromEnum(Op.PRINT));
 }
 
@@ -437,10 +237,10 @@ fn binary(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner
 }
 
 fn parsePrecedence(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, precedence: Prec) void {
-    advanceP(parser, scanner, buf);
+    advanceP(parser, scanner);
     prefix(gpa, currentChunk, parser, scanner, buf, parser.previous.typ);
     while (@intFromEnum(precedence) <= @intFromEnum(getPrecedence(parser.current.typ))) {
-        advanceP(parser, scanner, buf);
+        advanceP(parser, scanner);
         infix(gpa, currentChunk, parser, scanner, buf, parser.previous.typ);
     }
 }
@@ -542,38 +342,6 @@ fn infix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner:
     }
 }
 
-fn scanToken(scanner: *Scanner, file_buffer: []const u8) Token {
-    // scanToken
-    skipWhitespace(scanner, file_buffer);
-    scanner.start = scanner.current;
-    if (isAtEnd(scanner, file_buffer)) return try makeToken(scanner, TokenType.EOF);
-    var c = advance(scanner, file_buffer);
-    const token = try switch (c) {
-        '0'...'9' => number(scanner, file_buffer),
-        '(' => makeToken(scanner, TokenType.LEFT_PAREN),
-        ')' => makeToken(scanner, TokenType.RIGHT_PAREN),
-        '{' => makeToken(scanner, TokenType.LEFT_BRACE),
-        '}' => makeToken(scanner, TokenType.RIGHT_BRACE),
-        ';' => makeToken(scanner, TokenType.SEMICOLON),
-        ',' => makeToken(scanner, TokenType.COMMA),
-        '.' => makeToken(scanner, TokenType.DOT),
-        '-' => makeToken(scanner, TokenType.MINUS),
-        '+' => makeToken(scanner, TokenType.PLUS),
-        '/' => makeToken(scanner, TokenType.SLASH),
-        '*' => makeToken(scanner, TokenType.STAR),
-        '!' => makeToken(scanner, if (match(scanner, file_buffer, '=')) TokenType.BANG_EQUAL else TokenType.BANG),
-        '=' => makeToken(scanner, if (match(scanner, file_buffer, '=')) TokenType.EQUAL_EQUAL else TokenType.EQUAL),
-        '<' => makeToken(scanner, if (match(scanner, file_buffer, '=')) TokenType.LESS_EQUAL else TokenType.LESS),
-        '>' => makeToken(scanner, if (match(scanner, file_buffer, '=')) TokenType.GREATER_EQUAL else TokenType.GREATER),
-        '"' => string(scanner, file_buffer),
-        else => if (isAlpha(c))
-            identifier(scanner, file_buffer)
-        else
-            std.debug.panic("unknown char '{s}', scanner state: start={d} current={d} line={d}", .{ [1]u8{c}, scanner.start, scanner.current, scanner.line }),
-    };
-    return token;
-}
-
 fn disassembleChunk(chunks: *std.MultiArrayList(Chunk)) !void {
     const stdout_file = std.io.getStdOut().writer();
     var bw = std.io.bufferedWriter(stdout_file);
@@ -599,11 +367,11 @@ pub fn main() !void {
 
     const file_buffer = try file.readToEndAlloc(gpa, 1024);
 
-    var scanner = Scanner{ .start = 0, .current = 0, .line = 1 };
+    var scanner = Scanner{ .start = 0, .current = 0, .line = 1, .buf = file_buffer };
     var compilingChunk = Chunk{ .data = std.ArrayList(u8).init(gpa), .constants = std.ArrayList(Value).init(gpa), .line = 1 };
     var parser: Parser = undefined;
 
-    advanceP(&parser, &scanner, file_buffer);
+    advanceP(&parser, &scanner);
     while (true) {
         if (parser.current.typ == TokenType.EOF) {
             break;
