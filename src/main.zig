@@ -238,10 +238,15 @@ fn binary(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner
 
 fn parsePrecedence(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, precedence: Prec) void {
     advanceP(parser, scanner);
-    prefix(gpa, currentChunk, parser, scanner, buf, parser.previous.typ);
+    var canAssign = @intFromEnum(precedence) <= @intFromEnum(Prec.ASSIGNMENT);
+    prefix(gpa, currentChunk, parser, scanner, buf, parser.previous.typ, canAssign);
     while (@intFromEnum(precedence) <= @intFromEnum(getPrecedence(parser.current.typ))) {
         advanceP(parser, scanner);
-        infix(gpa, currentChunk, parser, scanner, buf, parser.previous.typ);
+        infix(gpa, currentChunk, parser, scanner, buf, parser.previous.typ, canAssign);
+    }
+
+    if (canAssign and matchP(TokenType.EQUAL, parser, scanner)) {
+        @panic("Invalid assignment target");
     }
 }
 
@@ -269,7 +274,7 @@ fn stringP(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, buf: [
 }
 
 // from https://github.com/jwmerrill/zig-lox/blob/main/src/compiler.zig
-fn prefix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, tokenType: TokenType) void {
+fn prefix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, tokenType: TokenType, canAssign: bool) void {
     switch (tokenType) {
         // Single-character tokens.
         .LEFT_PAREN => grouping(gpa, currentChunk, parser, scanner, buf),
@@ -279,7 +284,7 @@ fn prefix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner
         .NUMBER => numberP(currentChunk, parser, buf),
         .FALSE, .NIL, .TRUE => literalP(currentChunk, parser),
         .STRING => stringP(gpa, currentChunk, parser, buf),
-        .IDENTIFIER => variable(gpa, currentChunk, parser, buf) catch {},
+        .IDENTIFIER => variable(gpa, currentChunk, parser, scanner, buf, canAssign) catch {},
         else => panicToken(tokenType),
 
         //// One or two character tokens.
@@ -296,14 +301,20 @@ fn prefix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner
     }
 }
 
-fn variable(gpa: std.mem.Allocator, chunk: *Chunk, parser: *Parser, buf: []const u8) !void {
-    try namedVariable(parser.previous, gpa, chunk, buf);
+fn variable(gpa: std.mem.Allocator, chunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, canAssign: bool) !void {
+    try namedVariable(parser.previous, gpa, parser, scanner, chunk, buf, canAssign);
 }
 
-fn namedVariable(name: Token, gpa: std.mem.Allocator, currentChunk: *Chunk, buf: []const u8) !void {
+fn namedVariable(name: Token, gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, currentChunk: *Chunk, buf: []const u8, canAssign: bool) !void {
     var arg = try identifierConstant(gpa, name, currentChunk, buf);
-    try currentChunk.data.append(@intFromEnum(Op.GET_GLOBAL));
-    try currentChunk.data.append(arg);
+    if (canAssign and matchP(TokenType.EQUAL, parser, scanner)) {
+        expression(gpa, currentChunk, parser, scanner, buf);
+        try currentChunk.data.append(@intFromEnum(Op.SET_GLOBAL));
+        try currentChunk.data.append(arg);
+    } else {
+        try currentChunk.data.append(@intFromEnum(Op.GET_GLOBAL));
+        try currentChunk.data.append(arg);
+    }
 }
 
 fn panicToken(tokenType: TokenType) noreturn {
@@ -314,7 +325,8 @@ fn panicToken(tokenType: TokenType) noreturn {
     @panic(b2);
 }
 
-fn infix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, tokenType: TokenType) void {
+fn infix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, tokenType: TokenType, canAssign: bool) void {
+    _ = canAssign;
     switch (tokenType) {
         // Single-character tokens.
         .MINUS, .PLUS, .SLASH, .STAR, .BANG_EQUAL, .EQUAL_EQUAL, .GREATER, .GREATER_EQUAL, .LESS, .LESS_EQUAL => binary(gpa, currentChunk, parser, scanner, buf) catch {
@@ -537,6 +549,14 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
         }
         const op = @enumFromInt(Op, chunk.data.items[ip]);
         try stdout.print("executing ip={d}\n", .{ip});
+        //try stdout.print("stack elem 0: ", .{});
+        //try printValue(stdout, vm.stack[0]);
+        //try stdout.print("stack elem 1: ", .{});
+        //try printValue(stdout, vm.stack[1]);
+        //try stdout.print("stack elem 2: ", .{});
+        //try printValue(stdout, vm.stack[2]);
+        //try stdout.print("stack elem 3: ", .{});
+        //try printValue(stdout, vm.stack[3]);
         ip += 1;
         lst = op;
         switch (op) {
@@ -659,23 +679,29 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
                 const constidx = @as(usize, chunk.data.items[ip]);
                 ip += 1;
                 const name = try get_string(chunk.constants.items[constidx]);
-                try stdout.print("getting global using constant idx {d}. It is {s}\n", .{ constidx, name });
+                try stdout.print("getting global using constant idx {d}. It is '{s}'\n", .{ constidx, name });
                 var val = globals.get(name);
                 if (val) |v| {
                     vm.stackTop += 1;
                     try stdout.print("setting stack index {d}\n", .{vm.stackTop});
                     vm.stack[vm.stackTop] = v;
-                    //try stdout.print("stack elem 0: ", .{});
-                    //try printValue(stdout, vm.stack[0]);
-                    //try stdout.print("stack elem 1: ", .{});
-                    //try printValue(stdout, vm.stack[1]);
-                    //try stdout.print("stack elem 2: ", .{});
-                    //try printValue(stdout, vm.stack[2]);
-                    //try stdout.print("stack elem 3: ", .{});
-                    //try printValue(stdout, vm.stack[3]);
                 } else {
                     @panic("global not found");
                 }
+            },
+            .SET_GLOBAL => {
+                const constidx = @as(usize, chunk.data.items[ip]);
+                ip += 1;
+                const name = try get_string(chunk.constants.items[constidx]);
+                try stdout.print("writing global '{s}'\n", .{name});
+                if (!globals.contains(name)) {
+                    @panic("global not defined yet, can't assign to it");
+                    // chapter 21:
+                    //  If the variable hasn’t been defined yet, it’s a
+                    //  runtime error to try to assign to it. Lox doesn’t do
+                    //  implicit variable declaration.
+                }
+                try globals.put(name, vm.stack[vm.stackTop]);
             },
         }
     }
@@ -724,6 +750,7 @@ const Op = enum(u8) {
     POP,
     DEFINE_GLOBAL,
     GET_GLOBAL,
+    SET_GLOBAL,
 };
 
 fn demoChunks(gpa: std.mem.Allocator) !std.MultiArrayList(Chunk) {
