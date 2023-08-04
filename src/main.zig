@@ -75,16 +75,16 @@ fn emitConstant(currentChunk: *Chunk, val: Value) void {
     };
 }
 
-fn grouping(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) void {
-    expression(gpa, currentChunk, parser, scanner, buf);
+fn grouping(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) void {
+    expression(gpa, currentChunk, parser, scanner, current);
     consumeP(parser, scanner, TokenType.RIGHT_PAREN, "Expect ')' after expression.");
 }
 
-fn unary(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) void {
+fn unary(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) void {
     const operatorType = parser.previous.typ;
 
     // Compile the operand.
-    parsePrecedence(gpa, currentChunk, parser, scanner, buf, getPrecedence(operatorType).next());
+    parsePrecedence(gpa, currentChunk, parser, scanner, current, getPrecedence(operatorType).next());
 
     // Emit the operator instruction.
     switch (operatorType) {
@@ -116,34 +116,39 @@ const Prec = enum {
     }
 };
 
-fn expression(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) void {
-    parsePrecedence(gpa, currentChunk, parser, scanner, buf, Prec.ASSIGNMENT);
+fn expression(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) void {
+    parsePrecedence(gpa, currentChunk, parser, scanner, current, Prec.ASSIGNMENT);
 }
 
-fn declaration(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) !void {
+fn declaration(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, compiler: *Compiler) !void {
     if (matchP(TokenType.VAR, parser, scanner)) {
-        try varDeclaration(gpa, currentChunk, parser, scanner, buf);
+        try varDeclaration(gpa, currentChunk, parser, scanner, compiler);
     } else {
-        try statement(gpa, currentChunk, parser, scanner, buf);
+        try statement(gpa, currentChunk, parser, scanner, compiler);
     }
 }
 
-fn varDeclaration(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) !void {
-    var global = try parseVariable(gpa, currentChunk, parser, scanner, buf, "Expect variable name.");
+fn varDeclaration(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
+    var global = try parseVariable(gpa, currentChunk, parser, scanner, current, "Expect variable name.");
 
     if (matchP(TokenType.EQUAL, parser, scanner)) {
-        expression(gpa, currentChunk, parser, scanner, buf);
+        expression(gpa, currentChunk, parser, scanner, current);
     } else {
         try currentChunk.data.append(@intFromEnum(Op.NIL));
     }
     consumeP(parser, scanner, TokenType.SEMICOLON, "Expect ';' after variable declaration.");
 
-    try defineVariable(global, currentChunk);
+    std.debug.print("defining variable {d}\n", .{global});
+    try defineVariable(global, currentChunk, current);
 }
 
-fn parseVariable(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, errorMessage: []const u8) !usize {
+fn parseVariable(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler, errorMessage: []const u8) !usize {
     consumeP(parser, scanner, TokenType.IDENTIFIER, errorMessage);
-    return try identifierConstant(gpa, parser.previous, currentChunk, buf);
+
+    try declareVariable(scanner, parser, current);
+    if (current.scopeDepth > 0) return 0;
+
+    return try identifierConstant(gpa, parser.previous, currentChunk, scanner.buf);
 }
 
 fn identifierConstant(gpa: std.mem.Allocator, name: Token, currentChunk: *Chunk, buf: []const u8) !u8 {
@@ -154,7 +159,43 @@ fn identifierConstant(gpa: std.mem.Allocator, name: Token, currentChunk: *Chunk,
     return @truncate(u8, currentChunk.constants.items.len - 1);
 }
 
-fn defineVariable(global: usize, currentChunk: *Chunk) !void {
+fn identifiersEqual(scanner: *Scanner, a: *const Token, b: *const Token) bool {
+    if (a.length != b.length) return false;
+    const as = scanner.buf[a.start .. a.start + a.length];
+    const bs = scanner.buf[b.start .. b.start + b.length];
+    std.debug.print("comparing '{s}' '{s}'\n", .{ as, bs });
+    return std.mem.eql(u8, as, bs);
+}
+
+fn addLocal(current: *Compiler, name: Token) !void {
+    try current.locals.append(Local{ .name = name, .depth = -1 });
+}
+
+fn declareVariable(scanner: *Scanner, parser: *Parser, current: *Compiler) !void {
+    if (current.scopeDepth == 0) return;
+
+    var name: Token = parser.previous;
+    var i: i16 = @intCast(i16, current.locals.items.len);
+    i -= 1; // initially we point to the last elem
+    while (i >= 0) : (i -= 1) {
+        var local = &current.locals.items[@intCast(usize, i)];
+        if (local.depth != -1 and local.depth < current.scopeDepth) {
+            break;
+        }
+
+        if (identifiersEqual(scanner, &name, &local.name)) {
+            std.debug.print("Existing local (with index {d}) has depth {d}, we are on scopeDepth {d}\n", .{ i, local.depth, current.scopeDepth });
+            @panic("Already a variable with this name in this scope.");
+        }
+    }
+    try addLocal(current, name);
+}
+
+fn defineVariable(global: usize, currentChunk: *Chunk, current: *Compiler) !void {
+    if (current.scopeDepth > 0) {
+        current.markInitialized();
+        return;
+    }
     try currentChunk.data.append(@intFromEnum(Op.DEFINE_GLOBAL));
     try currentChunk.data.append(@truncate(u8, global));
 }
@@ -169,23 +210,37 @@ fn matchP(typ: TokenType, parser: *Parser, scanner: *Scanner) bool {
     return true;
 }
 
-fn statement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) !void {
+fn statement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, compiler: *Compiler) !void {
     if (matchP(TokenType.PRINT, parser, scanner)) {
         //std.debug.print("print\n", .{});
-        try printStatement(gpa, currentChunk, parser, scanner, buf);
+        try printStatement(gpa, currentChunk, parser, scanner, compiler);
+    } else if (matchP(TokenType.LEFT_BRACE, parser, scanner)) {
+        compiler.beginScope();
+        block(gpa, currentChunk, parser, scanner, compiler);
+        try compiler.endScope(currentChunk);
     } else {
-        try expressionStatement(gpa, currentChunk, parser, scanner, buf);
+        try expressionStatement(gpa, currentChunk, parser, scanner, compiler);
     }
 }
 
-fn expressionStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) !void {
-    expression(gpa, currentChunk, parser, scanner, buf);
+fn block(gpa: std.mem.Allocator, compilingChunk: *Chunk, parser: *Parser, scanner: *Scanner, compiler: *Compiler) void {
+    while (!check(TokenType.RIGHT_BRACE, parser) and !check(TokenType.EOF, parser)) {
+        declaration(gpa, compilingChunk, parser, scanner, compiler) catch {
+            @panic("exception in declaration");
+        };
+    }
+
+    consumeP(parser, scanner, TokenType.RIGHT_BRACE, "Expect '}' after block.");
+}
+
+fn expressionStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
+    expression(gpa, currentChunk, parser, scanner, current);
     consumeP(parser, scanner, TokenType.SEMICOLON, "Expect ';' after expression.");
     try currentChunk.data.append(@intFromEnum(Op.POP));
 }
 
-fn printStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) !void {
-    expression(gpa, currentChunk, parser, scanner, buf);
+fn printStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
+    expression(gpa, currentChunk, parser, scanner, current);
     consumeP(parser, scanner, TokenType.SEMICOLON, "Expect ';' after value.");
     try currentChunk.data.append(@intFromEnum(Op.PRINT));
 }
@@ -217,9 +272,9 @@ fn getPrecedence(tokenType: TokenType) Prec {
     };
 }
 
-fn binary(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8) !void {
+fn binary(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
     const operatorType: TokenType = parser.previous.typ;
-    parsePrecedence(gpa, currentChunk, parser, scanner, buf, getPrecedence(operatorType).next());
+    parsePrecedence(gpa, currentChunk, parser, scanner, current, getPrecedence(operatorType).next());
 
     switch (operatorType) {
         TokenType.BANG_EQUAL => try currentChunk.data.appendSlice(&[_]u8{ @intFromEnum(Op.EQUAL), @intFromEnum(Op.NOT) }),
@@ -236,13 +291,18 @@ fn binary(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner
     }
 }
 
-fn parsePrecedence(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, precedence: Prec) void {
+fn parsePrecedence(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler, precedence: Prec) void {
     advanceP(parser, scanner);
     var canAssign = @intFromEnum(precedence) <= @intFromEnum(Prec.ASSIGNMENT);
-    prefix(gpa, currentChunk, parser, scanner, buf, parser.previous.typ, canAssign);
+    if (canAssign) {
+        std.debug.print("canAssign=true\n", .{});
+    } else {
+        std.debug.print("canAssign=false\n", .{});
+    }
+    prefix(gpa, currentChunk, parser, scanner, current, parser.previous.typ, canAssign);
     while (@intFromEnum(precedence) <= @intFromEnum(getPrecedence(parser.current.typ))) {
         advanceP(parser, scanner);
-        infix(gpa, currentChunk, parser, scanner, buf, parser.previous.typ, canAssign);
+        infix(gpa, currentChunk, parser, scanner, current, parser.previous.typ, canAssign);
     }
 
     if (canAssign and matchP(TokenType.EQUAL, parser, scanner)) {
@@ -274,17 +334,20 @@ fn stringP(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, buf: [
 }
 
 // from https://github.com/jwmerrill/zig-lox/blob/main/src/compiler.zig
-fn prefix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, tokenType: TokenType, canAssign: bool) void {
+fn prefix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler, tokenType: TokenType, canAssign: bool) void {
+    std.debug.print("prefix {s}\n", .{@tagName(tokenType)});
     switch (tokenType) {
         // Single-character tokens.
-        .LEFT_PAREN => grouping(gpa, currentChunk, parser, scanner, buf),
-        .MINUS, .BANG => unary(gpa, currentChunk, parser, scanner, buf),
+        .LEFT_PAREN => grouping(gpa, currentChunk, parser, scanner, current),
+        .MINUS, .BANG => unary(gpa, currentChunk, parser, scanner, current),
         //.RIGHTPAREN, .LEFTBRACE, .RIGHTBRACE, .COMMA, .DOT => try self.prefixError(),
         //.Plus, .Semicolon, .Slash, .Star => try self.prefixError(),
-        .NUMBER => numberP(currentChunk, parser, buf),
+        .NUMBER => numberP(currentChunk, parser, scanner.buf),
         .FALSE, .NIL, .TRUE => literalP(currentChunk, parser),
-        .STRING => stringP(gpa, currentChunk, parser, buf),
-        .IDENTIFIER => variable(gpa, currentChunk, parser, scanner, buf, canAssign) catch {},
+        .STRING => stringP(gpa, currentChunk, parser, scanner.buf),
+        .IDENTIFIER => variable(gpa, currentChunk, parser, scanner, current, canAssign) catch {
+            @panic("exception in identifier");
+        },
         else => panicToken(tokenType),
 
         //// One or two character tokens.
@@ -301,20 +364,59 @@ fn prefix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner
     }
 }
 
-fn variable(gpa: std.mem.Allocator, chunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, canAssign: bool) !void {
-    try namedVariable(parser.previous, gpa, parser, scanner, chunk, buf, canAssign);
+fn variable(gpa: std.mem.Allocator, chunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler, canAssign: bool) !void {
+    try namedVariable(parser.previous, gpa, parser, scanner, chunk, current, canAssign);
 }
 
-fn namedVariable(name: Token, gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, currentChunk: *Chunk, buf: []const u8, canAssign: bool) !void {
-    var arg = try identifierConstant(gpa, name, currentChunk, buf);
+fn namedVariable(name: Token, gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, currentChunk: *Chunk, current: *Compiler, canAssign: bool) !void {
+    var getOp: Op = undefined;
+    var setOp: Op = undefined;
+    var iarg = resolveLocal(scanner, current, &name);
+    var arg: u8 = undefined;
+    if (iarg != -1) {
+        std.debug.print("namedVariable: local iarg={d}\n", .{iarg});
+        arg = @truncate(u8, @bitCast(u16, iarg));
+        getOp = Op.GET_LOCAL;
+        setOp = Op.SET_LOCAL;
+    } else {
+        std.debug.print("namedVariable: global\n", .{});
+        arg = try identifierConstant(gpa, name, currentChunk, scanner.buf);
+        getOp = Op.GET_GLOBAL;
+        setOp = Op.SET_GLOBAL;
+    }
+
     if (canAssign and matchP(TokenType.EQUAL, parser, scanner)) {
-        expression(gpa, currentChunk, parser, scanner, buf);
-        try currentChunk.data.append(@intFromEnum(Op.SET_GLOBAL));
+        std.debug.print("namedVariable: emitting set op {s}\n", .{@tagName(parser.current.typ)});
+        expression(gpa, currentChunk, parser, scanner, current);
+        try currentChunk.data.append(@intFromEnum(setOp));
         try currentChunk.data.append(arg);
     } else {
-        try currentChunk.data.append(@intFromEnum(Op.GET_GLOBAL));
+        std.debug.print("namedVariable: emitting get op {s}\n", .{@tagName(parser.current.typ)});
+        try currentChunk.data.append(@intFromEnum(getOp));
         try currentChunk.data.append(arg);
     }
+}
+
+fn resolveLocal(scanner: *Scanner, compiler: *Compiler, name: *const Token) i16 {
+    var i = @intCast(i16, compiler.locals.items.len);
+    std.debug.print("resolveLocal: amt of locals {d}\n", .{i});
+    i -= 1; // initiallly we point to the last element
+    while (i >= 0) : (i -= 1) {
+        var local = compiler.locals.items[@intCast(usize, i)];
+        std.debug.print("resolveLocal: scrutinizing {d} {s}\n", .{ i, @tagName(local.name.typ) });
+        if (identifiersEqual(scanner, name, &local.name)) {
+            if (local.depth == -1) {
+                @panic("Can't read local variable in its own initializer.");
+            }
+            std.debug.print("resolveLocal: match\n", .{});
+
+            return @intCast(i16, i);
+        } else {
+            std.debug.print("resolveLocal: no match\n", .{});
+        }
+    }
+
+    return -1;
 }
 
 fn panicToken(tokenType: TokenType) noreturn {
@@ -325,11 +427,11 @@ fn panicToken(tokenType: TokenType) noreturn {
     @panic(b2);
 }
 
-fn infix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, buf: []const u8, tokenType: TokenType, canAssign: bool) void {
+fn infix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler, tokenType: TokenType, canAssign: bool) void {
     _ = canAssign;
     switch (tokenType) {
         // Single-character tokens.
-        .MINUS, .PLUS, .SLASH, .STAR, .BANG_EQUAL, .EQUAL_EQUAL, .GREATER, .GREATER_EQUAL, .LESS, .LESS_EQUAL => binary(gpa, currentChunk, parser, scanner, buf) catch {
+        .MINUS, .PLUS, .SLASH, .STAR, .BANG_EQUAL, .EQUAL_EQUAL, .GREATER, .GREATER_EQUAL, .LESS, .LESS_EQUAL => binary(gpa, currentChunk, parser, scanner, current) catch {
             @panic("binary failed");
         },
         else => panicToken(tokenType),
@@ -359,12 +461,61 @@ fn disassembleChunk(chunks: *std.MultiArrayList(Chunk)) !void {
     var bw = std.io.bufferedWriter(stdout_file);
     const stdout = bw.writer();
     const data = chunks.items(.data);
-    for (data, 0..) |op, idx| {
-        const openum = @enumFromInt(Op, op.items[0]);
-        try stdout.print("processing idx idx={d} data.len={d} {s} op.items.len={d}\n", .{ idx, data.len, @tagName(openum), op.items.len });
+    var idx: usize = 0;
+    while (idx < data.len) : (idx += 1) {
+        const opdata = data[idx];
+        const openum = @enumFromInt(Op, opdata.items[0]);
+        try stdout.print("processing idx idx={d} data.len={d} {s} opdata.items.len={d}\n", .{ idx, data.len, @tagName(openum), opdata.items.len });
+        var opidx: usize = 0;
+        while (opidx < opdata.items.len) : (opidx += 1) {
+            const op = opdata.items[opidx];
+            try stdout.print("idx idx={d} op={d} tag={s} len={d}\n", .{ opidx, op, @tagName(@enumFromInt(Op, op)), opdata.items.len });
+            const o = @enumFromInt(Op, op);
+            if (o == Op.CONSTANT) {
+                const constidx = opdata.items[opidx + 1];
+                try bw.flush();
+                try stdout.print("constant {d} {s}\n", .{ constidx, showVal(chunks.items(.constants)[idx].items[constidx]) });
+            }
+            switch (o) {
+                .GET_LOCAL, .SET_LOCAL, .SET_GLOBAL, .GET_GLOBAL, .CONSTANT, .DEFINE_GLOBAL => {
+                    opidx += 1;
+                },
+                else => {},
+            }
+        }
         try bw.flush();
     }
 }
+
+const Local = struct {
+    name: Token,
+    depth: i16,
+};
+
+const Compiler = struct {
+    locals: std.ArrayList(Local),
+    scopeDepth: u8,
+
+    fn beginScope(this: *Compiler) void {
+        this.scopeDepth += 1;
+    }
+
+    fn endScope(this: *Compiler, currentChunk: *Chunk) !void {
+        this.scopeDepth -= 1;
+
+        while (this.locals.items.len > 0 and
+            this.locals.getLast().depth > this.scopeDepth)
+        {
+            try currentChunk.data.append(@intFromEnum(Op.POP));
+            _ = this.locals.pop();
+        }
+    }
+
+    fn markInitialized(current: *Compiler) void {
+        var last = current.locals.items.len - 1;
+        current.locals.items[last].depth = current.scopeDepth;
+    }
+};
 
 pub fn main() !void {
     const stdout_file = std.io.getStdOut().writer();
@@ -381,6 +532,7 @@ pub fn main() !void {
 
     var scanner = Scanner{ .start = 0, .current = 0, .line = 1, .buf = file_buffer };
     var compilingChunk = Chunk{ .data = std.ArrayList(u8).init(gpa), .constants = std.ArrayList(Value).init(gpa), .line = 1 };
+    var compiler = Compiler{ .locals = std.ArrayList(Local).init(gpa), .scopeDepth = 0 };
     var parser: Parser = undefined;
 
     advanceP(&parser, &scanner);
@@ -390,7 +542,7 @@ pub fn main() !void {
         }
         //try stdout.print("declaration? {}\n", .{parser.current.typ});
         try bw.flush();
-        try declaration(gpa, &compilingChunk, &parser, &scanner, file_buffer);
+        try declaration(gpa, &compilingChunk, &parser, &scanner, &compiler);
     }
 
     {
@@ -405,7 +557,6 @@ pub fn main() !void {
     };
     try runChunk(gpa, &compilingChunk, &vm);
     vm.stackTop = 0;
-    std.os.exit(0);
 
     //var chunks = try demoChunks(gpa);
 
@@ -703,6 +854,22 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
                 }
                 try globals.put(name, vm.stack[vm.stackTop]);
             },
+            .GET_LOCAL => {
+                const slot = @as(usize, chunk.data.items[ip]);
+                try stdout.print("getting local from slot {d}\n", .{slot});
+                ip += 1;
+                vm.stackTop += 1;
+                try stdout.print("storing local at {d}\n", .{vm.stackTop});
+                // slot is off by one because we are incrementing stackTop
+                // before use in constant as if it didn't point past the last
+                // elem. This plus one shouldn't be there
+                vm.stack[vm.stackTop] = vm.stack[slot + 1];
+            },
+            .SET_LOCAL => {
+                const slot = @as(usize, chunk.data.items[ip]);
+                ip += 1;
+                vm.stack[slot] = vm.stack[vm.stackTop];
+            },
         }
     }
     try bw.flush();
@@ -751,6 +918,8 @@ const Op = enum(u8) {
     DEFINE_GLOBAL,
     GET_GLOBAL,
     SET_GLOBAL,
+    GET_LOCAL,
+    SET_LOCAL,
 };
 
 fn demoChunks(gpa: std.mem.Allocator) !std.MultiArrayList(Chunk) {
