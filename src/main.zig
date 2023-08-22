@@ -47,12 +47,15 @@ const Value = union(ValueTag) {
     string: []u8,
 };
 
+const red = "\x1b[31m";
+const reset_sequence = "\x1b[0m";
+
 fn printValue(stdout: anytype, val: Value) !void {
     switch (val) {
-        .number => |num| try stdout.print("printValue: {d}\n", .{num}),
-        .boolean => |boo| try stdout.print("printValue: {}\n", .{boo}),
-        .string => |str| try stdout.print("printValue: {s}\n", .{str}),
-        .nil => try stdout.print("printValue: nil\n", .{}),
+        .number => |num| try stdout.print("printValue: {s}{d}{s}\n", .{ red, num, reset_sequence }),
+        .boolean => |boo| try stdout.print("printValue: {s}{}{s}\n", .{ red, boo, reset_sequence }),
+        .string => |str| try stdout.print("printValue: {s}{s}{s}\n", .{ red, str, reset_sequence }),
+        .nil => try stdout.print("printValue: {s}nil{s}\n", .{ red, reset_sequence }),
     }
 }
 
@@ -61,6 +64,15 @@ fn numberP(currentChunk: *Chunk, parser: *Parser, buf: []const u8) void {
         @panic("invalid");
     };
     emitConstant(currentChunk, Value{ .number = value });
+}
+
+fn emitJump(instruction: Op, currentChunk: *Chunk) !u16 {
+    try currentChunk.data.append(@intFromEnum(instruction));
+    try currentChunk.data.append(0xff);
+    try currentChunk.data.append(0xff);
+    if (currentChunk.data.items.len >= 0xffff)
+        @panic("chunk too long");
+    return @truncate(u16, currentChunk.data.items.len - 2);
 }
 
 fn emitConstant(currentChunk: *Chunk, val: Value) void {
@@ -73,6 +85,37 @@ fn emitConstant(currentChunk: *Chunk, val: Value) void {
     currentChunk.data.append(@truncate(u8, currentChunk.constants.items.len - 1)) catch {
         @panic("couldn't add length");
     };
+}
+
+fn emitLoop(loopStart: u16, currentChunk: *Chunk) !void {
+    try currentChunk.data.append(@intFromEnum(Op.LOOP));
+
+    if (currentChunk.data.items.len > 0xffff)
+        @panic("chunk too big");
+
+    var len = @truncate(u16, currentChunk.data.items.len);
+    if (loopStart > len or loopStart >= 0xfffd) {
+        @panic("loop start too big");
+    }
+    const offset: u16 = len - loopStart + 2;
+
+    try currentChunk.data.append(@truncate(u8, (offset >> 8) & 0xff));
+    try currentChunk.data.append(@truncate(u8, offset & 0xff));
+}
+
+fn patchJump(offset: u16, currentChunk: *Chunk) void {
+    // -2 to adjust for the bytecode for the jump offset itself.
+    const jump = @intCast(i64, currentChunk.data.items.len) - @intCast(i64, offset) - 2;
+
+    if (jump < 0) {
+        @panic("offset pointed too far back");
+    }
+    if (jump > 0xffff) {
+        @panic("Too much code to jump over.");
+    }
+
+    currentChunk.data.items[offset] = @intCast(u8, (jump >> 8) & 0xff);
+    currentChunk.data.items[offset + 1] = @intCast(u8, jump & 0xff);
 }
 
 fn grouping(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) void {
@@ -200,6 +243,26 @@ fn defineVariable(global: usize, currentChunk: *Chunk, current: *Compiler) !void
     try currentChunk.data.append(@truncate(u8, global));
 }
 
+fn and_(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
+    const endJump = try emitJump(Op.JUMP_IF_FALSE, currentChunk);
+
+    try currentChunk.data.append(@intFromEnum(Op.POP));
+    parsePrecedence(gpa, currentChunk, parser, scanner, current, Prec.AND);
+
+    patchJump(endJump, currentChunk);
+}
+
+fn or_(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
+    const elseJump = try emitJump(Op.JUMP_IF_FALSE, currentChunk);
+    const endJump = try emitJump(Op.JUMP, currentChunk);
+
+    patchJump(elseJump, currentChunk);
+    try currentChunk.data.append(@intFromEnum(Op.POP));
+
+    parsePrecedence(gpa, currentChunk, parser, scanner, current, Prec.OR);
+    patchJump(endJump, currentChunk);
+}
+
 fn check(typ: TokenType, parser: *Parser) bool {
     return parser.current.typ == typ;
 }
@@ -210,10 +273,16 @@ fn matchP(typ: TokenType, parser: *Parser, scanner: *Scanner) bool {
     return true;
 }
 
-fn statement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, compiler: *Compiler) !void {
+fn statement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, compiler: *Compiler) anyerror!void {
     if (matchP(TokenType.PRINT, parser, scanner)) {
         //std.debug.print("print\n", .{});
         try printStatement(gpa, currentChunk, parser, scanner, compiler);
+    } else if (matchP(TokenType.FOR, parser, scanner)) {
+        try forStatement(gpa, currentChunk, parser, scanner, compiler);
+    } else if (matchP(TokenType.IF, parser, scanner)) {
+        try ifStatement(gpa, currentChunk, parser, scanner, compiler);
+    } else if (matchP(TokenType.WHILE, parser, scanner)) {
+        try whileStatement(gpa, currentChunk, parser, scanner, compiler);
     } else if (matchP(TokenType.LEFT_BRACE, parser, scanner)) {
         compiler.beginScope();
         block(gpa, currentChunk, parser, scanner, compiler);
@@ -239,10 +308,93 @@ fn expressionStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Pa
     try currentChunk.data.append(@intFromEnum(Op.POP));
 }
 
+fn forStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, compiler: *Compiler) !void {
+    compiler.beginScope();
+    consumeP(parser, scanner, TokenType.LEFT_PAREN, "Expect '(' after 'for'.");
+    if (matchP(TokenType.SEMICOLON, parser, scanner)) {
+        // No initializer.
+    } else if (matchP(TokenType.VAR, parser, scanner)) {
+        try varDeclaration(gpa, currentChunk, parser, scanner, compiler);
+    } else {
+        try expressionStatement(gpa, currentChunk, parser, scanner, compiler);
+    }
+
+    if (currentChunk.data.items.len >= 0xfff0)
+        @panic("chunk too big");
+    var loopStart = @truncate(u16, currentChunk.data.items.len);
+    var exitJump: ?u16 = null; // -1 in original source
+    if (!matchP(TokenType.SEMICOLON, parser, scanner)) {
+        expression(gpa, currentChunk, parser, scanner, compiler);
+        consumeP(parser, scanner, TokenType.SEMICOLON, "Expect ';' after loop condition.");
+
+        // Jump out of the loop if the condition is false.
+        exitJump = try emitJump(Op.JUMP_IF_FALSE, currentChunk);
+        try currentChunk.data.append(@intFromEnum(Op.POP)); // Condition.
+    }
+
+    if (!matchP(TokenType.RIGHT_PAREN, parser, scanner)) {
+        const bodyJump = try emitJump(Op.JUMP, currentChunk);
+        const incrementStart = @truncate(u16, currentChunk.data.items.len);
+        expression(gpa, currentChunk, parser, scanner, compiler);
+        try currentChunk.data.append(@intFromEnum(Op.POP));
+        consumeP(parser, scanner, TokenType.RIGHT_PAREN, "Expect ')' after for clauses.");
+
+        try emitLoop(loopStart, currentChunk);
+        loopStart = incrementStart;
+        patchJump(bodyJump, currentChunk);
+    }
+
+    try statement(gpa, currentChunk, parser, scanner, compiler);
+    try emitLoop(loopStart, currentChunk);
+
+    if (exitJump) |nonNullExitJump| {
+        patchJump(nonNullExitJump, currentChunk);
+        try currentChunk.data.append(@intFromEnum(Op.POP)); // Condition.
+    }
+
+    try compiler.endScope(currentChunk);
+}
+
+fn ifStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
+    consumeP(parser, scanner, TokenType.LEFT_PAREN, "expect '('");
+    expression(gpa, currentChunk, parser, scanner, current);
+    consumeP(parser, scanner, TokenType.RIGHT_PAREN, "expect ')'");
+
+    const thenJump = try emitJump(Op.JUMP_IF_FALSE, currentChunk);
+    try currentChunk.data.append(@intFromEnum(Op.POP));
+    try statement(gpa, currentChunk, parser, scanner, current);
+
+    const elseJump = try emitJump(Op.JUMP, currentChunk);
+
+    patchJump(thenJump, currentChunk);
+    try currentChunk.data.append(@intFromEnum(Op.POP));
+
+    if (matchP(TokenType.ELSE, parser, scanner)) {
+        try statement(gpa, currentChunk, parser, scanner, current);
+    }
+    patchJump(elseJump, currentChunk);
+}
+
 fn printStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
     expression(gpa, currentChunk, parser, scanner, current);
     consumeP(parser, scanner, TokenType.SEMICOLON, "Expect ';' after value.");
     try currentChunk.data.append(@intFromEnum(Op.PRINT));
+}
+
+fn whileStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
+    const loopStart = currentChunk.data.items.len;
+    consumeP(parser, scanner, TokenType.LEFT_PAREN, "Expect '(' after 'while'.");
+    expression(gpa, currentChunk, parser, scanner, current);
+    consumeP(parser, scanner, TokenType.RIGHT_PAREN, "Expect ')' after condition.");
+
+    const exitJump = try emitJump(Op.JUMP_IF_FALSE, currentChunk);
+    try currentChunk.data.append(@intFromEnum(Op.POP));
+    try statement(gpa, currentChunk, parser, scanner, current);
+    if (loopStart > 0xffff) @panic("too big");
+    try emitLoop(@truncate(u16, loopStart), currentChunk);
+
+    patchJump(exitJump, currentChunk);
+    try currentChunk.data.append(@intFromEnum(Op.POP));
 }
 
 fn getPrecedence(tokenType: TokenType) Prec {
@@ -434,6 +586,16 @@ fn infix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner:
         .MINUS, .PLUS, .SLASH, .STAR, .BANG_EQUAL, .EQUAL_EQUAL, .GREATER, .GREATER_EQUAL, .LESS, .LESS_EQUAL => binary(gpa, currentChunk, parser, scanner, current) catch {
             @panic("binary failed");
         },
+        .AND => {
+            and_(gpa, currentChunk, parser, scanner, current) catch {
+                @panic("and failed");
+            };
+        },
+        .OR => {
+            or_(gpa, currentChunk, parser, scanner, current) catch {
+                @panic("or failed");
+            };
+        },
         else => panicToken(tokenType),
         //.LeftParen => try self.call(),
         //.Dot => try self.dot(canAssign),
@@ -456,7 +618,7 @@ fn infix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner:
     }
 }
 
-fn disassembleChunk(chunks: *std.MultiArrayList(Chunk)) !void {
+fn disassembleChunk(gpa: std.mem.Allocator, chunks: *std.MultiArrayList(Chunk)) !void {
     const stdout_file = std.io.getStdOut().writer();
     var bw = std.io.bufferedWriter(stdout_file);
     const stdout = bw.writer();
@@ -474,11 +636,14 @@ fn disassembleChunk(chunks: *std.MultiArrayList(Chunk)) !void {
             if (o == Op.CONSTANT) {
                 const constidx = opdata.items[opidx + 1];
                 try bw.flush();
-                try stdout.print("constant {d} {s}\n", .{ constidx, showVal(chunks.items(.constants)[idx].items[constidx]) });
+                try stdout.print("constant {d} {s}\n", .{ constidx, try showVal(gpa, chunks.items(.constants)[idx].items[constidx]) });
             }
             switch (o) {
                 .GET_LOCAL, .SET_LOCAL, .SET_GLOBAL, .GET_GLOBAL, .CONSTANT, .DEFINE_GLOBAL => {
                     opidx += 1;
+                },
+                .JUMP, .JUMP_IF_FALSE, .LOOP => {
+                    opidx += 2;
                 },
                 else => {},
             }
@@ -549,7 +714,7 @@ pub fn main() !void {
         var chunks = std.MultiArrayList(Chunk){};
         try chunks.append(gpa, compilingChunk);
         //try stdout.print("chunks: {d}\n", .{chunks.len});
-        try disassembleChunk(&chunks);
+        try disassembleChunk(gpa, &chunks);
     }
     var vm = VM{
         .stack = undefined,
@@ -666,7 +831,7 @@ fn isFalsey(value: Value) bool {
     }
 }
 
-fn showVal(val: Value) []const u8 {
+fn showVal(gpa: std.mem.Allocator, val: Value) ![]const u8 {
     switch (val) {
         .nil => return "nil",
         .boolean => |b| if (b) {
@@ -675,11 +840,7 @@ fn showVal(val: Value) []const u8 {
             return "false";
         },
         .number => |n| {
-            var a: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
-            _ = std.fmt.bufPrint(&a, "{d}", .{n}) catch {
-                @panic("lol");
-            };
-            return &a;
+            return try std.fmt.allocPrint(gpa, "{d}", .{n});
         },
         .string => |str| return str,
     }
@@ -740,6 +901,8 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
                 const a = try get_number(vm.stack[vm.stackTop - 1]);
                 vm.stackTop -= 1;
                 vm.stack[vm.stackTop] = Value{ .boolean = a < b };
+                try stdout.print("less: reading first argument from stack index {d}\n", .{vm.stackTop});
+                try stdout.print("less: {d} < {d}\n", .{ a, b });
             },
             .NOT => {
                 const b = vm.stack[vm.stackTop];
@@ -749,21 +912,21 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
                 vm.stackTop += 1;
                 vm.stack[vm.stackTop] = chunk.constants.items[@as(usize, chunk.data.items[ip])];
                 ip += 1;
-                try stdout.print("constant: {s}, stored at stackTop={d}\n", .{ showVal(vm.stack[vm.stackTop]), vm.stackTop });
+                try stdout.print("constant: {s}, stored at stackTop={d}\n", .{ try showVal(gpa, vm.stack[vm.stackTop]), vm.stackTop });
             },
             .MULTIPLY => {
                 const b = try get_number(vm.stack[vm.stackTop - 0]);
                 const a = try get_number(vm.stack[vm.stackTop - 1]);
                 vm.stackTop -= 1;
                 vm.stack[vm.stackTop] = Value{ .number = a * b };
-                try stdout.print("mult: a={d} b={d} res={s}, new reduced stackTop={d} \n", .{ a, b, showVal(vm.stack[vm.stackTop]), vm.stackTop });
+                try stdout.print("mult: a={d} b={d} res={s}, new reduced stackTop={d} \n", .{ a, b, try showVal(gpa, vm.stack[vm.stackTop]), vm.stackTop });
             },
             .DIVIDE => {
                 const b = try get_number(vm.stack[vm.stackTop - 0]);
                 const a = try get_number(vm.stack[vm.stackTop - 1]);
                 vm.stackTop -= 1;
                 vm.stack[vm.stackTop] = Value{ .number = a / b };
-                try stdout.print("divide: a={d} b={d} res={s}, new reduced stackTop={d} \n", .{ a, b, showVal(vm.stack[vm.stackTop]), vm.stackTop });
+                try stdout.print("divide: a={d} b={d} res={s}, new reduced stackTop={d} \n", .{ a, b, try showVal(gpa, vm.stack[vm.stackTop]), vm.stackTop });
             },
             .NEGATE => {
                 const old = try get_number(vm.stack[vm.stackTop]);
@@ -772,7 +935,7 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
                 vm.stack[vm.stackTop] = Value{ .number = res };
             },
             .RETURN => {
-                try stdout.print("return: {s} read from stackTop={d}\n", .{ showVal(vm.stack[vm.stackTop]), vm.stackTop });
+                try stdout.print("return: {s} read from stackTop={d}\n", .{ try showVal(gpa, vm.stack[vm.stackTop]), vm.stackTop });
             },
             .SUBTRACT => {
                 try stdout.print("sub: original stackTop={d}\n", .{vm.stackTop});
@@ -780,7 +943,7 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
                 const a = try get_number(vm.stack[vm.stackTop - 1]);
                 vm.stackTop -= 1;
                 vm.stack[vm.stackTop] = Value{ .number = a - b };
-                try stdout.print("sub: a={d} b={d} res={d}, new reduced stackTop={d}\n", .{ a, b, showVal(vm.stack[vm.stackTop]), vm.stackTop });
+                try stdout.print("sub: a={d} b={d} res={d}, new reduced stackTop={d}\n", .{ a, b, try showVal(gpa, vm.stack[vm.stackTop]), vm.stackTop });
             },
             .ADD => {
                 try stdout.print("add: original stackTop={d}\n", .{vm.stackTop});
@@ -792,7 +955,7 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
                         const an = try get_number(a);
                         vm.stackTop -= 1;
                         vm.stack[vm.stackTop] = Value{ .number = an + bn };
-                        try stdout.print("add: a={d} b={d} res={s}, new reduced stackTop={d}\n", .{ an, bn, showVal(vm.stack[vm.stackTop]), vm.stackTop });
+                        try stdout.print("add: a={d} b={d} res={s}, stored result at new reduced stackTop={d}\n", .{ an, bn, try showVal(gpa, vm.stack[vm.stackTop]), vm.stackTop });
                     },
                     .string => |bs| {
                         const as = try get_string(a);
@@ -856,19 +1019,41 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
             },
             .GET_LOCAL => {
                 const slot = @as(usize, chunk.data.items[ip]);
-                try stdout.print("getting local from slot {d}\n", .{slot});
+                try stdout.print("getting local from slot {d}\n", .{slot + 1});
                 ip += 1;
                 vm.stackTop += 1;
-                try stdout.print("storing local at {d}\n", .{vm.stackTop});
+                try stdout.print("storing local at {d}: {s}\n", .{ vm.stackTop, try showVal(gpa, vm.stack[slot + 1]) });
                 // slot is off by one because we are incrementing stackTop
-                // before use in constant as if it didn't point past the last
-                // elem. This plus one shouldn't be there
+                // before use in the CONSTANT branch as if it didn't point
+                // past the last elem. This plus one shouldn't be there
                 vm.stack[vm.stackTop] = vm.stack[slot + 1];
             },
             .SET_LOCAL => {
                 const slot = @as(usize, chunk.data.items[ip]);
                 ip += 1;
-                vm.stack[slot] = vm.stack[vm.stackTop];
+                vm.stack[slot + 1] = vm.stack[vm.stackTop];
+                try stdout.print("setting local at slot {d} to value at stack index {d}: {s}\n", .{ slot + 1, vm.stackTop, try showVal(gpa, vm.stack[vm.stackTop]) });
+            },
+            .JUMP => {
+                ip += 2;
+                const hi = chunk.data.items[ip - 2];
+                const lo = chunk.data.items[ip - 1];
+                const offset = @intCast(u16, hi) << 8 | @intCast(u16, lo);
+                ip += offset;
+            },
+            .JUMP_IF_FALSE => {
+                ip += 2;
+                const hi = chunk.data.items[ip - 2];
+                const lo = chunk.data.items[ip - 1];
+                const offset = @intCast(u16, hi) << 8 | @intCast(u16, lo);
+                if (isFalsey(vm.stack[vm.stackTop])) ip += offset;
+            },
+            .LOOP => {
+                ip += 2;
+                const hi = chunk.data.items[ip - 2];
+                const lo = chunk.data.items[ip - 1];
+                const offset = @intCast(u16, hi) << 8 | @intCast(u16, lo);
+                ip -= offset;
             },
         }
     }
@@ -914,6 +1099,9 @@ const Op = enum(u8) {
     NEGATE,
     RETURN,
     PRINT,
+    JUMP,
+    JUMP_IF_FALSE,
+    LOOP,
     POP,
     DEFINE_GLOBAL,
     GET_GLOBAL,
