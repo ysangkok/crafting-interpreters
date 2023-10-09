@@ -38,6 +38,13 @@ const ValueTag = enum {
     boolean,
     nil,
     string,
+    function,
+};
+
+const Function = struct {
+    arity: u8,
+    chunk: Chunk,
+    name: []const u8,
 };
 
 const Value = union(ValueTag) {
@@ -45,6 +52,7 @@ const Value = union(ValueTag) {
     boolean: bool,
     nil: void,
     string: []u8,
+    function: Function,
 };
 
 const red = "\x1b[31m";
@@ -56,6 +64,7 @@ fn printValue(stdout: anytype, val: Value) !void {
         .boolean => |boo| try stdout.print("printValue: {s}{}{s}\n", .{ red, boo, reset_sequence }),
         .string => |str| try stdout.print("printValue: {s}{s}{s}\n", .{ red, str, reset_sequence }),
         .nil => try stdout.print("printValue: {s}nil{s}\n", .{ red, reset_sequence }),
+        .function => |_| try stdout.print("printValue: {s}function{s}\n", .{ red, reset_sequence }),
     }
 }
 
@@ -118,23 +127,23 @@ fn patchJump(offset: u16, currentChunk: *Chunk) void {
     currentChunk.data.items[offset + 1] = @intCast(u8, jump & 0xff);
 }
 
-fn grouping(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) void {
-    expression(gpa, currentChunk, parser, scanner, current);
+fn grouping(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) void {
+    expression(gpa, parser, scanner, current);
     consumeP(parser, scanner, TokenType.RIGHT_PAREN, "Expect ')' after expression.");
 }
 
-fn unary(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) void {
+fn unary(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) void {
     const operatorType = parser.previous.typ;
 
     // Compile the operand.
-    parsePrecedence(gpa, currentChunk, parser, scanner, current, getPrecedence(operatorType).next());
+    parsePrecedence(gpa, current.currentChunk(), parser, scanner, current, getPrecedence(operatorType).next());
 
     // Emit the operator instruction.
     switch (operatorType) {
-        TokenType.BANG => currentChunk.data.append(@intFromEnum(Op.NOT)) catch {
+        TokenType.BANG => current.currentChunk().data.append(@intFromEnum(Op.NOT)) catch {
             @panic("error in bang");
         },
-        TokenType.MINUS => currentChunk.data.append(@intFromEnum(Op.NEGATE)) catch {
+        TokenType.MINUS => current.currentChunk().data.append(@intFromEnum(Op.NEGATE)) catch {
             @panic("error in minus");
         },
         else => unreachable, // Unreachable.
@@ -159,30 +168,30 @@ const Prec = enum {
     }
 };
 
-fn expression(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) void {
-    parsePrecedence(gpa, currentChunk, parser, scanner, current, Prec.ASSIGNMENT);
+fn expression(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) void {
+    parsePrecedence(gpa, current.currentChunk(), parser, scanner, current, Prec.ASSIGNMENT);
 }
 
-fn declaration(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, compiler: *Compiler) !void {
+fn declaration(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, compiler: *Compiler) !void {
     if (matchP(TokenType.VAR, parser, scanner)) {
-        try varDeclaration(gpa, currentChunk, parser, scanner, compiler);
+        try varDeclaration(gpa, parser, scanner, compiler);
     } else {
-        try statement(gpa, currentChunk, parser, scanner, compiler);
+        try statement(gpa, parser, scanner, compiler);
     }
 }
 
-fn varDeclaration(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
-    var global = try parseVariable(gpa, currentChunk, parser, scanner, current, "Expect variable name.");
+fn varDeclaration(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
+    var global = try parseVariable(gpa, current.currentChunk(), parser, scanner, current, "Expect variable name.");
 
     if (matchP(TokenType.EQUAL, parser, scanner)) {
-        expression(gpa, currentChunk, parser, scanner, current);
+        expression(gpa, parser, scanner, current);
     } else {
-        try currentChunk.data.append(@intFromEnum(Op.NIL));
+        try current.currentChunk().data.append(@intFromEnum(Op.NIL));
     }
     consumeP(parser, scanner, TokenType.SEMICOLON, "Expect ';' after variable declaration.");
 
     std.debug.print("defining variable {d}\n", .{global});
-    try defineVariable(global, currentChunk, current);
+    try defineVariable(global, current);
 }
 
 fn parseVariable(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler, errorMessage: []const u8) !usize {
@@ -234,13 +243,13 @@ fn declareVariable(scanner: *Scanner, parser: *Parser, current: *Compiler) !void
     try addLocal(current, name);
 }
 
-fn defineVariable(global: usize, currentChunk: *Chunk, current: *Compiler) !void {
+fn defineVariable(global: usize, current: *Compiler) !void {
     if (current.scopeDepth > 0) {
         current.markInitialized();
         return;
     }
-    try currentChunk.data.append(@intFromEnum(Op.DEFINE_GLOBAL));
-    try currentChunk.data.append(@truncate(u8, global));
+    try current.currentChunk().data.append(@intFromEnum(Op.DEFINE_GLOBAL));
+    try current.currentChunk().data.append(@truncate(u8, global));
 }
 
 fn and_(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
@@ -273,28 +282,28 @@ fn matchP(typ: TokenType, parser: *Parser, scanner: *Scanner) bool {
     return true;
 }
 
-fn statement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, compiler: *Compiler) anyerror!void {
+fn statement(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, compiler: *Compiler) anyerror!void {
     if (matchP(TokenType.PRINT, parser, scanner)) {
         //std.debug.print("print\n", .{});
-        try printStatement(gpa, currentChunk, parser, scanner, compiler);
+        try printStatement(gpa, parser, scanner, compiler);
     } else if (matchP(TokenType.FOR, parser, scanner)) {
-        try forStatement(gpa, currentChunk, parser, scanner, compiler);
+        try forStatement(gpa, parser, scanner, compiler);
     } else if (matchP(TokenType.IF, parser, scanner)) {
-        try ifStatement(gpa, currentChunk, parser, scanner, compiler);
+        try ifStatement(gpa, parser, scanner, compiler);
     } else if (matchP(TokenType.WHILE, parser, scanner)) {
-        try whileStatement(gpa, currentChunk, parser, scanner, compiler);
+        try whileStatement(gpa, parser, scanner, compiler);
     } else if (matchP(TokenType.LEFT_BRACE, parser, scanner)) {
         compiler.beginScope();
-        block(gpa, currentChunk, parser, scanner, compiler);
-        try compiler.endScope(currentChunk);
+        block(gpa, parser, scanner, compiler);
+        try compiler.endScope();
     } else {
-        try expressionStatement(gpa, currentChunk, parser, scanner, compiler);
+        try expressionStatement(gpa, parser, scanner, compiler);
     }
 }
 
-fn block(gpa: std.mem.Allocator, compilingChunk: *Chunk, parser: *Parser, scanner: *Scanner, compiler: *Compiler) void {
+fn block(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, compiler: *Compiler) void {
     while (!check(TokenType.RIGHT_BRACE, parser) and !check(TokenType.EOF, parser)) {
-        declaration(gpa, compilingChunk, parser, scanner, compiler) catch {
+        declaration(gpa, parser, scanner, compiler) catch {
             @panic("exception in declaration");
         };
     }
@@ -302,99 +311,99 @@ fn block(gpa: std.mem.Allocator, compilingChunk: *Chunk, parser: *Parser, scanne
     consumeP(parser, scanner, TokenType.RIGHT_BRACE, "Expect '}' after block.");
 }
 
-fn expressionStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
-    expression(gpa, currentChunk, parser, scanner, current);
+fn expressionStatement(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
+    expression(gpa, parser, scanner, current);
     consumeP(parser, scanner, TokenType.SEMICOLON, "Expect ';' after expression.");
-    try currentChunk.data.append(@intFromEnum(Op.POP));
+    try current.currentChunk().data.append(@intFromEnum(Op.POP));
 }
 
-fn forStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, compiler: *Compiler) !void {
+fn forStatement(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, compiler: *Compiler) !void {
     compiler.beginScope();
     consumeP(parser, scanner, TokenType.LEFT_PAREN, "Expect '(' after 'for'.");
     if (matchP(TokenType.SEMICOLON, parser, scanner)) {
         // No initializer.
     } else if (matchP(TokenType.VAR, parser, scanner)) {
-        try varDeclaration(gpa, currentChunk, parser, scanner, compiler);
+        try varDeclaration(gpa, parser, scanner, compiler);
     } else {
-        try expressionStatement(gpa, currentChunk, parser, scanner, compiler);
+        try expressionStatement(gpa, parser, scanner, compiler);
     }
 
-    if (currentChunk.data.items.len >= 0xfff0)
+    if (compiler.currentChunk().data.items.len >= 0xfff0)
         @panic("chunk too big");
-    var loopStart = @truncate(u16, currentChunk.data.items.len);
+    var loopStart = @truncate(u16, compiler.currentChunk().data.items.len);
     var exitJump: ?u16 = null; // -1 in original source
     if (!matchP(TokenType.SEMICOLON, parser, scanner)) {
-        expression(gpa, currentChunk, parser, scanner, compiler);
+        expression(gpa, parser, scanner, compiler);
         consumeP(parser, scanner, TokenType.SEMICOLON, "Expect ';' after loop condition.");
 
         // Jump out of the loop if the condition is false.
-        exitJump = try emitJump(Op.JUMP_IF_FALSE, currentChunk);
-        try currentChunk.data.append(@intFromEnum(Op.POP)); // Condition.
+        exitJump = try emitJump(Op.JUMP_IF_FALSE, compiler.currentChunk());
+        try compiler.currentChunk().data.append(@intFromEnum(Op.POP)); // Condition.
     }
 
     if (!matchP(TokenType.RIGHT_PAREN, parser, scanner)) {
-        const bodyJump = try emitJump(Op.JUMP, currentChunk);
-        const incrementStart = @truncate(u16, currentChunk.data.items.len);
-        expression(gpa, currentChunk, parser, scanner, compiler);
-        try currentChunk.data.append(@intFromEnum(Op.POP));
+        const bodyJump = try emitJump(Op.JUMP, compiler.currentChunk());
+        const incrementStart = @truncate(u16, compiler.currentChunk().data.items.len);
+        expression(gpa, parser, scanner, compiler);
+        try compiler.currentChunk().data.append(@intFromEnum(Op.POP));
         consumeP(parser, scanner, TokenType.RIGHT_PAREN, "Expect ')' after for clauses.");
 
-        try emitLoop(loopStart, currentChunk);
+        try emitLoop(loopStart, compiler.currentChunk());
         loopStart = incrementStart;
-        patchJump(bodyJump, currentChunk);
+        patchJump(bodyJump, compiler.currentChunk());
     }
 
-    try statement(gpa, currentChunk, parser, scanner, compiler);
-    try emitLoop(loopStart, currentChunk);
+    try statement(gpa, parser, scanner, compiler);
+    try emitLoop(loopStart, compiler.currentChunk());
 
     if (exitJump) |nonNullExitJump| {
-        patchJump(nonNullExitJump, currentChunk);
-        try currentChunk.data.append(@intFromEnum(Op.POP)); // Condition.
+        patchJump(nonNullExitJump, compiler.currentChunk());
+        try compiler.currentChunk().data.append(@intFromEnum(Op.POP)); // Condition.
     }
 
-    try compiler.endScope(currentChunk);
+    try compiler.endScope();
 }
 
-fn ifStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
+fn ifStatement(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
     consumeP(parser, scanner, TokenType.LEFT_PAREN, "expect '('");
-    expression(gpa, currentChunk, parser, scanner, current);
+    expression(gpa, parser, scanner, current);
     consumeP(parser, scanner, TokenType.RIGHT_PAREN, "expect ')'");
 
-    const thenJump = try emitJump(Op.JUMP_IF_FALSE, currentChunk);
-    try currentChunk.data.append(@intFromEnum(Op.POP));
-    try statement(gpa, currentChunk, parser, scanner, current);
+    const thenJump = try emitJump(Op.JUMP_IF_FALSE, current.currentChunk());
+    try current.currentChunk().data.append(@intFromEnum(Op.POP));
+    try statement(gpa, parser, scanner, current);
 
-    const elseJump = try emitJump(Op.JUMP, currentChunk);
+    const elseJump = try emitJump(Op.JUMP, current.currentChunk());
 
-    patchJump(thenJump, currentChunk);
-    try currentChunk.data.append(@intFromEnum(Op.POP));
+    patchJump(thenJump, current.currentChunk());
+    try current.currentChunk().data.append(@intFromEnum(Op.POP));
 
     if (matchP(TokenType.ELSE, parser, scanner)) {
-        try statement(gpa, currentChunk, parser, scanner, current);
+        try statement(gpa, parser, scanner, current);
     }
-    patchJump(elseJump, currentChunk);
+    patchJump(elseJump, current.currentChunk());
 }
 
-fn printStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
-    expression(gpa, currentChunk, parser, scanner, current);
+fn printStatement(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
+    expression(gpa, parser, scanner, current);
     consumeP(parser, scanner, TokenType.SEMICOLON, "Expect ';' after value.");
-    try currentChunk.data.append(@intFromEnum(Op.PRINT));
+    try current.currentChunk().data.append(@intFromEnum(Op.PRINT));
 }
 
-fn whileStatement(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
-    const loopStart = currentChunk.data.items.len;
+fn whileStatement(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
+    const loopStart = current.currentChunk().data.items.len;
     consumeP(parser, scanner, TokenType.LEFT_PAREN, "Expect '(' after 'while'.");
-    expression(gpa, currentChunk, parser, scanner, current);
+    expression(gpa, parser, scanner, current);
     consumeP(parser, scanner, TokenType.RIGHT_PAREN, "Expect ')' after condition.");
 
-    const exitJump = try emitJump(Op.JUMP_IF_FALSE, currentChunk);
-    try currentChunk.data.append(@intFromEnum(Op.POP));
-    try statement(gpa, currentChunk, parser, scanner, current);
+    const exitJump = try emitJump(Op.JUMP_IF_FALSE, current.currentChunk());
+    try current.currentChunk().data.append(@intFromEnum(Op.POP));
+    try statement(gpa, parser, scanner, current);
     if (loopStart > 0xffff) @panic("too big");
-    try emitLoop(@truncate(u16, loopStart), currentChunk);
+    try emitLoop(@truncate(u16, loopStart), current.currentChunk());
 
-    patchJump(exitJump, currentChunk);
-    try currentChunk.data.append(@intFromEnum(Op.POP));
+    patchJump(exitJump, current.currentChunk());
+    try current.currentChunk().data.append(@intFromEnum(Op.POP));
 }
 
 fn getPrecedence(tokenType: TokenType) Prec {
@@ -490,8 +499,8 @@ fn prefix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner
     std.debug.print("prefix {s}\n", .{@tagName(tokenType)});
     switch (tokenType) {
         // Single-character tokens.
-        .LEFT_PAREN => grouping(gpa, currentChunk, parser, scanner, current),
-        .MINUS, .BANG => unary(gpa, currentChunk, parser, scanner, current),
+        .LEFT_PAREN => grouping(gpa, parser, scanner, current),
+        .MINUS, .BANG => unary(gpa, parser, scanner, current),
         //.RIGHTPAREN, .LEFTBRACE, .RIGHTBRACE, .COMMA, .DOT => try self.prefixError(),
         //.Plus, .Semicolon, .Slash, .Star => try self.prefixError(),
         .NUMBER => numberP(currentChunk, parser, scanner.buf),
@@ -539,7 +548,7 @@ fn namedVariable(name: Token, gpa: std.mem.Allocator, parser: *Parser, scanner: 
 
     if (canAssign and matchP(TokenType.EQUAL, parser, scanner)) {
         std.debug.print("namedVariable: emitting set op {s}\n", .{@tagName(parser.current.typ)});
-        expression(gpa, currentChunk, parser, scanner, current);
+        expression(gpa, parser, scanner, current);
         try currentChunk.data.append(@intFromEnum(setOp));
         try currentChunk.data.append(arg);
     } else {
@@ -626,8 +635,8 @@ fn disassembleChunk(gpa: std.mem.Allocator, chunks: *std.MultiArrayList(Chunk)) 
     var idx: usize = 0;
     while (idx < data.len) : (idx += 1) {
         const opdata = data[idx];
-        const openum = @enumFromInt(Op, opdata.items[0]);
-        try stdout.print("processing idx idx={d} data.len={d} {s} opdata.items.len={d}\n", .{ idx, data.len, @tagName(openum), opdata.items.len });
+        try stdout.print("processing idx idx={d} data.len={d} opdata.items.len={d}\n", .{ idx, data.len, opdata.items.len });
+        //const openum = @enumFromInt(Op, opdata.items[0]);
         var opidx: usize = 0;
         while (opidx < opdata.items.len) : (opidx += 1) {
             const op = opdata.items[opidx];
@@ -657,7 +666,15 @@ const Local = struct {
     depth: i16,
 };
 
+const FunctionType = enum {
+    function,
+    script,
+};
+
 const Compiler = struct {
+    function: Function,
+    function_type: FunctionType,
+
     locals: std.ArrayList(Local),
     scopeDepth: u8,
 
@@ -665,13 +682,13 @@ const Compiler = struct {
         this.scopeDepth += 1;
     }
 
-    fn endScope(this: *Compiler, currentChunk: *Chunk) !void {
+    fn endScope(this: *Compiler) !void {
         this.scopeDepth -= 1;
 
         while (this.locals.items.len > 0 and
             this.locals.getLast().depth > this.scopeDepth)
         {
-            try currentChunk.data.append(@intFromEnum(Op.POP));
+            try this.currentChunk().data.append(@intFromEnum(Op.POP));
             _ = this.locals.pop();
         }
     }
@@ -679,6 +696,10 @@ const Compiler = struct {
     fn markInitialized(current: *Compiler) void {
         var last = current.locals.items.len - 1;
         current.locals.items[last].depth = current.scopeDepth;
+    }
+
+    fn currentChunk(current: *Compiler) *Chunk {
+        return &current.function.chunk;
     }
 };
 
@@ -697,7 +718,8 @@ pub fn main() !void {
 
     var scanner = Scanner{ .start = 0, .current = 0, .line = 1, .buf = file_buffer };
     var compilingChunk = Chunk{ .data = std.ArrayList(u8).init(gpa), .constants = std.ArrayList(Value).init(gpa), .line = 1 };
-    var compiler = Compiler{ .locals = std.ArrayList(Local).init(gpa), .scopeDepth = 0 };
+    var fun = Function{ .arity = 0, .chunk = compilingChunk, .name = "<script>" };
+    var compiler = Compiler{ .function = fun, .function_type = FunctionType.script, .locals = std.ArrayList(Local).init(gpa), .scopeDepth = 0 };
     var parser: Parser = undefined;
 
     advanceP(&parser, &scanner);
@@ -707,12 +729,13 @@ pub fn main() !void {
         }
         //try stdout.print("declaration? {}\n", .{parser.current.typ});
         try bw.flush();
-        try declaration(gpa, &compilingChunk, &parser, &scanner, &compiler);
+        try declaration(gpa, &parser, &scanner, &compiler);
     }
 
     {
         var chunks = std.MultiArrayList(Chunk){};
-        try chunks.append(gpa, compilingChunk);
+        var chk = compiler.currentChunk();
+        try chunks.append(gpa, chk.*);
         //try stdout.print("chunks: {d}\n", .{chunks.len});
         try disassembleChunk(gpa, &chunks);
     }
@@ -720,7 +743,7 @@ pub fn main() !void {
         .stack = undefined,
         .stackTop = 0,
     };
-    try runChunk(gpa, &compilingChunk, &vm);
+    try runChunk(gpa, compiler.currentChunk(), &vm);
     vm.stackTop = 0;
 
     //var chunks = try demoChunks(gpa);
@@ -820,6 +843,7 @@ fn valuesEqual(a: Value, b: Value) bool {
         .nil => return true,
         .number => |num| return num == b.number,
         .string => |str| return std.mem.eql(u8, str, b.string),
+        .function => |_| return false,
     }
 }
 
@@ -827,6 +851,7 @@ fn isFalsey(value: Value) bool {
     switch (value) {
         .nil => return true,
         .boolean => |boo| return !boo,
+        .function => return true, // Not sure, TODO
         else => return false,
     }
 }
@@ -843,6 +868,7 @@ fn showVal(gpa: std.mem.Allocator, val: Value) ![]const u8 {
             return try std.fmt.allocPrint(gpa, "{d}", .{n});
         },
         .string => |str| return str,
+        .function => |fun| return try std.fmt.allocPrint(gpa, "<fn {s}>", .{fun.name}),
     }
 }
 
@@ -968,6 +994,9 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
                     },
                     .boolean => |_| {
                         @panic("invalid bool for + operator");
+                    },
+                    .function => |_| {
+                        @panic("invalid function for + operator");
                     },
                 }
             },
