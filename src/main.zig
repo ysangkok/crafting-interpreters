@@ -55,6 +55,12 @@ const Value = union(ValueTag) {
     function: Function,
 };
 
+const CallFrame = struct {
+    function: *Function,
+    ip: usize,
+    slots: []Value,
+};
+
 const red = "\x1b[31m";
 const reset_sequence = "\x1b[0m";
 
@@ -672,7 +678,7 @@ const FunctionType = enum {
 };
 
 const Compiler = struct {
-    function: Function,
+    function: *Function,
     function_type: FunctionType,
 
     locals: std.ArrayList(Local),
@@ -719,7 +725,7 @@ pub fn main() !void {
     var scanner = Scanner{ .start = 0, .current = 0, .line = 1, .buf = file_buffer };
     var compilingChunk = Chunk{ .data = std.ArrayList(u8).init(gpa), .constants = std.ArrayList(Value).init(gpa), .line = 1 };
     var fun = Function{ .arity = 0, .chunk = compilingChunk, .name = "<script>" };
-    var compiler = Compiler{ .function = fun, .function_type = FunctionType.script, .locals = std.ArrayList(Local).init(gpa), .scopeDepth = 0 };
+    var compiler = Compiler{ .function = &fun, .function_type = FunctionType.script, .locals = std.ArrayList(Local).init(gpa), .scopeDepth = 0 };
     var parser: Parser = undefined;
 
     advanceP(&parser, &scanner);
@@ -740,10 +746,14 @@ pub fn main() !void {
         try disassembleChunk(gpa, &chunks);
     }
     var vm = VM{
+        .frames = std.ArrayList(CallFrame).init(gpa),
         .stack = undefined,
         .stackTop = 0,
     };
-    try runChunk(gpa, compiler.currentChunk(), &vm);
+    vm.stackTop += 1;
+    vm.stack[vm.stackTop] = Value{ .function = fun };
+    try vm.frames.append(CallFrame{ .ip = 0, .slots = &vm.stack, .function = &fun });
+    try runChunk(gpa, &vm);
     vm.stackTop = 0;
 
     //var chunks = try demoChunks(gpa);
@@ -811,6 +821,7 @@ pub fn main() !void {
 //}
 
 const VM = struct {
+    frames: std.ArrayList(CallFrame),
     stackTop: usize,
     stack: [256]Value,
 };
@@ -872,7 +883,7 @@ fn showVal(gpa: std.mem.Allocator, val: Value) ![]const u8 {
     }
 }
 
-fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
+fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
     const stdout_file = std.io.getStdOut().writer();
     var bw = std.io.bufferedWriter(stdout_file);
     const stdout = bw.writer();
@@ -880,13 +891,15 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
     var globals = std.StringHashMap(Value).init(gpa);
 
     var lst: Op = undefined;
-    var ip: usize = 0;
+    var frame: *CallFrame = &vm.frames.items[vm.frames.items.len - 1];
     while (true) {
-        if (ip >= chunk.data.items.len) {
+        const chunk: *Chunk = &frame.function.chunk;
+        if (frame.ip >= chunk.data.items.len) {
+            //try stdout.print("breaking, ip out of range {d} {d}\n", .{ frame.ip, chunk.data.items.len });
             break;
         }
-        const op = @enumFromInt(Op, chunk.data.items[ip]);
-        try stdout.print("executing ip={d}\n", .{ip});
+        const op = @enumFromInt(Op, chunk.data.items[frame.ip]);
+        try stdout.print("executing ip={d}\n", .{frame.ip});
         //try stdout.print("stack elem 0: ", .{});
         //try printValue(stdout, vm.stack[0]);
         //try stdout.print("stack elem 1: ", .{});
@@ -895,7 +908,7 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
         //try printValue(stdout, vm.stack[2]);
         //try stdout.print("stack elem 3: ", .{});
         //try printValue(stdout, vm.stack[3]);
-        ip += 1;
+        frame.ip += 1;
         lst = op;
         switch (op) {
             .NIL => {
@@ -936,8 +949,8 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
             },
             .CONSTANT => {
                 vm.stackTop += 1;
-                vm.stack[vm.stackTop] = chunk.constants.items[@as(usize, chunk.data.items[ip])];
-                ip += 1;
+                vm.stack[vm.stackTop] = chunk.constants.items[@as(usize, chunk.data.items[frame.ip])];
+                frame.ip += 1;
                 try stdout.print("constant: {s}, stored at stackTop={d}\n", .{ try showVal(gpa, vm.stack[vm.stackTop]), vm.stackTop });
             },
             .MULTIPLY => {
@@ -1010,8 +1023,8 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
                 vm.stackTop -= 1;
             },
             .DEFINE_GLOBAL => {
-                const name = try get_string(chunk.constants.items[@as(usize, chunk.data.items[ip])]);
-                ip += 1;
+                const name = try get_string(chunk.constants.items[@as(usize, chunk.data.items[frame.ip])]);
+                frame.ip += 1;
                 //try stdout.print("defining global {s}\n", .{name});
                 //try printValue(stdout, vm.stack[vm.stackTop]);
                 try globals.putNoClobber(name, vm.stack[vm.stackTop]);
@@ -1019,8 +1032,8 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
                 try stdout.print("defining global {s}, decresed stack from {d} (read from here) to {d}\n", .{ name, vm.stackTop + 1, vm.stackTop });
             },
             .GET_GLOBAL => {
-                const constidx = @as(usize, chunk.data.items[ip]);
-                ip += 1;
+                const constidx = @as(usize, chunk.data.items[frame.ip]);
+                frame.ip += 1;
                 const name = try get_string(chunk.constants.items[constidx]);
                 try stdout.print("getting global using constant idx {d}. It is '{s}'\n", .{ constidx, name });
                 var val = globals.get(name);
@@ -1033,8 +1046,8 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
                 }
             },
             .SET_GLOBAL => {
-                const constidx = @as(usize, chunk.data.items[ip]);
-                ip += 1;
+                const constidx = @as(usize, chunk.data.items[frame.ip]);
+                frame.ip += 1;
                 const name = try get_string(chunk.constants.items[constidx]);
                 try stdout.print("writing global '{s}'\n", .{name});
                 if (!globals.contains(name)) {
@@ -1047,42 +1060,42 @@ fn runChunk(gpa: std.mem.Allocator, chunk: *Chunk, vm: *VM) !void {
                 try globals.put(name, vm.stack[vm.stackTop]);
             },
             .GET_LOCAL => {
-                const slot = @as(usize, chunk.data.items[ip]);
+                const slot = @as(usize, chunk.data.items[frame.ip]);
                 try stdout.print("getting local from slot {d}\n", .{slot + 1});
-                ip += 1;
+                frame.ip += 1;
                 vm.stackTop += 1;
                 try stdout.print("storing local at {d}: {s}\n", .{ vm.stackTop, try showVal(gpa, vm.stack[slot + 1]) });
                 // slot is off by one because we are incrementing stackTop
                 // before use in the CONSTANT branch as if it didn't point
                 // past the last elem. This plus one shouldn't be there
-                vm.stack[vm.stackTop] = vm.stack[slot + 1];
+                vm.stack[vm.stackTop] = frame.slots[slot + 1];
             },
             .SET_LOCAL => {
-                const slot = @as(usize, chunk.data.items[ip]);
-                ip += 1;
-                vm.stack[slot + 1] = vm.stack[vm.stackTop];
+                const slot = @as(usize, chunk.data.items[frame.ip]);
+                frame.ip += 1;
+                frame.slots[slot + 1] = vm.stack[vm.stackTop];
                 try stdout.print("setting local at slot {d} to value at stack index {d}: {s}\n", .{ slot + 1, vm.stackTop, try showVal(gpa, vm.stack[vm.stackTop]) });
             },
             .JUMP => {
-                ip += 2;
-                const hi = chunk.data.items[ip - 2];
-                const lo = chunk.data.items[ip - 1];
+                frame.ip += 2;
+                const hi = chunk.data.items[frame.ip - 2];
+                const lo = chunk.data.items[frame.ip - 1];
                 const offset = @intCast(u16, hi) << 8 | @intCast(u16, lo);
-                ip += offset;
+                frame.ip += offset;
             },
             .JUMP_IF_FALSE => {
-                ip += 2;
-                const hi = chunk.data.items[ip - 2];
-                const lo = chunk.data.items[ip - 1];
+                frame.ip += 2;
+                const hi = chunk.data.items[frame.ip - 2];
+                const lo = chunk.data.items[frame.ip - 1];
                 const offset = @intCast(u16, hi) << 8 | @intCast(u16, lo);
-                if (isFalsey(vm.stack[vm.stackTop])) ip += offset;
+                if (isFalsey(vm.stack[vm.stackTop])) frame.ip += offset;
             },
             .LOOP => {
-                ip += 2;
-                const hi = chunk.data.items[ip - 2];
-                const lo = chunk.data.items[ip - 1];
+                frame.ip += 2;
+                const hi = chunk.data.items[frame.ip - 2];
+                const lo = chunk.data.items[frame.ip - 1];
                 const offset = @intCast(u16, hi) << 8 | @intCast(u16, lo);
-                ip -= offset;
+                frame.ip -= offset;
             },
         }
     }
