@@ -30,6 +30,7 @@ fn consumeP(parser: *Parser, scanner: *Scanner, typ: TokenType, message: []const
         return;
     }
 
+    std.debug.print("mismatching, consumeP crashing: {s} {s}\n", .{ @tagName(parser.current.typ), @tagName(typ) });
     @panic(message);
 }
 
@@ -58,7 +59,7 @@ const Value = union(ValueTag) {
 const CallFrame = struct {
     function: *Function,
     ip: usize,
-    slots: []Value,
+    slotsOffset: usize,
 };
 
 const red = "\x1b[31m";
@@ -305,6 +306,8 @@ fn statement(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, compile
         try forStatement(gpa, parser, scanner, compiler);
     } else if (matchP(TokenType.IF, parser, scanner)) {
         try ifStatement(gpa, parser, scanner, compiler);
+    } else if (matchP(TokenType.RETURN, parser, scanner)) {
+        try returnStatement(gpa, parser, scanner, compiler);
     } else if (matchP(TokenType.WHILE, parser, scanner)) {
         try whileStatement(gpa, parser, scanner, compiler);
     } else if (matchP(TokenType.LEFT_BRACE, parser, scanner)) {
@@ -446,6 +449,20 @@ fn printStatement(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, cu
     expression(gpa, parser, scanner, current);
     consumeP(parser, scanner, TokenType.SEMICOLON, "Expect ';' after value.");
     try current.currentChunk().data.append(@intFromEnum(Op.PRINT));
+}
+
+fn returnStatement(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
+    if (current.function_type == FunctionType.script) {
+        @panic("can't return from top-level");
+    }
+    if (matchP(TokenType.SEMICOLON, parser, scanner)) {
+        try current.currentChunk().data.append(@intFromEnum(Op.NIL));
+        try current.currentChunk().data.append(@intFromEnum(Op.RETURN));
+    } else {
+        expression(gpa, parser, scanner, current);
+        consumeP(parser, scanner, TokenType.SEMICOLON, "Expect ';' after return value;");
+        try current.currentChunk().data.append(@intFromEnum(Op.RETURN));
+    }
 }
 
 fn whileStatement(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
@@ -646,6 +663,31 @@ fn panicToken(tokenType: TokenType) noreturn {
     @panic(b2);
 }
 
+fn argumentList(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) u8 {
+    var argCount: u8 = 0;
+    if (!check(TokenType.RIGHT_PAREN, parser)) {
+        while (true) {
+            expression(gpa, parser, scanner, current);
+            if (argCount == 255) {
+                @panic("Can't have more than 255 arguments.");
+            }
+            argCount += 1;
+            if (!matchP(TokenType.COMMA, parser, scanner)) {
+                break;
+            }
+        }
+    }
+
+    consumeP(parser, scanner, TokenType.RIGHT_PAREN, "Expect ')' after arguments.");
+    return argCount;
+}
+
+fn callP(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
+    const argCount = argumentList(gpa, parser, scanner, current);
+    try current.currentChunk().data.append(@intFromEnum(Op.CALL));
+    try current.currentChunk().data.append(argCount);
+}
+
 fn infix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler, tokenType: TokenType, canAssign: bool) void {
     _ = canAssign;
     switch (tokenType) {
@@ -663,8 +705,12 @@ fn infix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner:
                 @panic("or failed");
             };
         },
+        .LEFT_PAREN => {
+            callP(gpa, parser, scanner, current) catch {
+                @panic("call failed");
+            };
+        },
         else => panicToken(tokenType),
-        //.LeftParen => try self.call(),
         //.Dot => try self.dot(canAssign),
         //.RightParen, .LeftBrace, .RightBrace, .Comma, .Semicolon => try self.infixError(),
 
@@ -706,7 +752,7 @@ fn disassembleChunk(gpa: std.mem.Allocator, chunks: *std.MultiArrayList(Chunk)) 
                 try stdout.print("constant {d} {s}\n", .{ constidx, try showVal(gpa, chunks.items(.constants)[idx].items[constidx]) });
             }
             switch (o) {
-                .GET_LOCAL, .SET_LOCAL, .SET_GLOBAL, .GET_GLOBAL, .CONSTANT, .DEFINE_GLOBAL => {
+                .GET_LOCAL, .SET_LOCAL, .SET_GLOBAL, .GET_GLOBAL, .CONSTANT, .DEFINE_GLOBAL, .CALL => {
                     opidx += 1;
                 },
                 .JUMP, .JUMP_IF_FALSE, .LOOP => {
@@ -763,6 +809,7 @@ const Compiler = struct {
     }
 
     fn endCompiler(current: *Compiler) !*Function {
+        try current.currentChunk().data.append(@intFromEnum(Op.NIL));
         try current.currentChunk().data.append(@intFromEnum(Op.RETURN));
         const fun = current.function;
         current.* = current.enclosing.?.*;
@@ -773,7 +820,7 @@ const Compiler = struct {
 pub fn main() !void {
     const stdout_file = std.io.getStdOut().writer();
     var bw = std.io.bufferedWriter(stdout_file);
-    //const stdout = bw.writer();
+    const stdout = bw.writer();
 
     var gen = std.heap.GeneralPurposeAllocator(.{}){};
     var gpa = gen.allocator();
@@ -794,7 +841,7 @@ pub fn main() !void {
         if (parser.current.typ == TokenType.EOF) {
             break;
         }
-        //try stdout.print("declaration? {}\n", .{parser.current.typ});
+        try stdout.print("declaration? {}\n", .{parser.current.typ});
         try bw.flush();
         try declaration(gpa, &parser, &scanner, &compiler);
     }
@@ -813,7 +860,10 @@ pub fn main() !void {
     };
     vm.stackTop += 1;
     vm.stack[vm.stackTop] = Value{ .function = &fun };
-    try vm.frames.append(CallFrame{ .ip = 0, .slots = &vm.stack, .function = &fun });
+
+    //try vm.frames.append(CallFrame{ .ip = 0, .slots = &vm.stack, .function = &fun });
+    _ = try call(&fun, 0, &vm);
+
     try runChunk(gpa, &vm);
     vm.stackTop = 0;
 
@@ -1036,6 +1086,26 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
             },
             .RETURN => {
                 try stdout.print("return: {s} read from stackTop={d}\n", .{ try showVal(gpa, vm.stack[vm.stackTop]), vm.stackTop });
+
+                // pop
+                const result = vm.stack[vm.stackTop];
+                vm.stackTop -= 1;
+
+                if (vm.frames.items.len == 1) {
+                    vm.stackTop -= 1; // pop
+                    @panic("INTERPRET OK (should quit)");
+                }
+                _ = vm.frames.pop();
+
+                vm.stackTop = frame.slotsOffset;
+
+                // push
+                vm.stackTop += 1;
+                vm.stack[vm.stackTop] = result;
+
+                try stdout.print("return: wrote result {s} to stack position {d}\n", .{ try showVal(gpa, vm.stack[vm.stackTop]), vm.stackTop });
+                try stdout.print("return: switching to frame {d}\n", .{vm.frames.items.len - 1});
+                frame = &vm.frames.items[vm.frames.items.len - 1];
             },
             .SUBTRACT => {
                 try stdout.print("sub: original stackTop={d}\n", .{vm.stackTop});
@@ -1129,12 +1199,12 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
                 // slot is off by one because we are incrementing stackTop
                 // before use in the CONSTANT branch as if it didn't point
                 // past the last elem. This plus one shouldn't be there
-                vm.stack[vm.stackTop] = frame.slots[slot + 1];
+                vm.stack[vm.stackTop] = vm.stack[frame.slotsOffset + slot + 1];
             },
             .SET_LOCAL => {
                 const slot = @as(usize, chunk.data.items[frame.ip]);
                 frame.ip += 1;
-                frame.slots[slot + 1] = vm.stack[vm.stackTop];
+                vm.stack[frame.slotsOffset + slot + 1] = vm.stack[vm.stackTop];
                 try stdout.print("setting local at slot {d} to value at stack index {d}: {s}\n", .{ slot + 1, vm.stackTop, try showVal(gpa, vm.stack[vm.stackTop]) });
             },
             .JUMP => {
@@ -1158,9 +1228,39 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
                 const offset = @intCast(u16, hi) << 8 | @intCast(u16, lo);
                 frame.ip -= offset;
             },
+            .CALL => {
+                const argCount = chunk.data.items[frame.ip];
+                frame.ip += 1;
+                const functionToCall = vm.stack[vm.stackTop - argCount];
+                if (!try callValue(functionToCall, argCount, vm)) {
+                    @panic("CallValue returned false, are you calling a non-function?");
+                }
+                const idx = vm.frames.items.len - 1;
+                try stdout.print("returning to frame {d}\n", .{idx});
+                frame = &vm.frames.items[idx];
+            },
         }
     }
     try bw.flush();
+}
+
+fn call(fun: *Function, argCount: u8, vm: *VM) !bool {
+    if (argCount != fun.arity) {
+        @panic("function arity mismatch");
+    }
+    var frame = CallFrame{ .function = fun, .ip = 0, .slotsOffset = vm.stackTop - argCount - 1 };
+    try vm.frames.append(frame);
+    return true;
+}
+
+fn callValue(callee: Value, argCount: u8, vm: *VM) !bool {
+    switch (callee) {
+        .function => |fun| {
+            //std.debug.print("calling {s}\n", .{fun.name});
+            return try call(fun, argCount, vm);
+        },
+        else => return false,
+    }
 }
 
 fn concatAndReturnBuffer(allocator: std.mem.Allocator, one: []const u8, two: []const u8) ![]u8 {
@@ -1205,6 +1305,7 @@ const Op = enum(u8) {
     JUMP,
     JUMP_IF_FALSE,
     LOOP,
+    CALL,
     POP,
     DEFINE_GLOBAL,
     GET_GLOBAL,

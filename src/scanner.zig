@@ -226,7 +226,7 @@ fn isDigit(c: u8) bool {
 }
 
 fn isAlpha(c: u8) bool {
-    return c >= 'a' and c <= 'z' or c >= 'A' and c <= 'A' or c == '_';
+    return c >= 'a' and c <= 'z' or c >= 'A' and c <= 'Z' or c == '_';
 }
 
 fn checkKeyword(scanner: *Scanner, start: u16, rest: []const u8, typ: TokenType) TokenType {
