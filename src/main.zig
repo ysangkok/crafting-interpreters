@@ -52,7 +52,7 @@ const Value = union(ValueTag) {
     boolean: bool,
     nil: void,
     string: []u8,
-    function: Function,
+    function: *Function,
 };
 
 const CallFrame = struct {
@@ -178,8 +178,17 @@ fn expression(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, curren
     parsePrecedence(gpa, current.currentChunk(), parser, scanner, current, Prec.ASSIGNMENT);
 }
 
+fn funDeclaration(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, compiler: *Compiler) !void {
+    const global = try parseVariable(gpa, parser, scanner, compiler, "Expect function name.");
+    compiler.markInitialized();
+    try function(gpa, FunctionType.function, parser, scanner, compiler);
+    try defineVariable(global, compiler);
+}
+
 fn declaration(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, compiler: *Compiler) !void {
-    if (matchP(TokenType.VAR, parser, scanner)) {
+    if (matchP(TokenType.FUN, parser, scanner)) {
+        try funDeclaration(gpa, parser, scanner, compiler);
+    } else if (matchP(TokenType.VAR, parser, scanner)) {
         try varDeclaration(gpa, parser, scanner, compiler);
     } else {
         try statement(gpa, parser, scanner, compiler);
@@ -187,7 +196,7 @@ fn declaration(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, compi
 }
 
 fn varDeclaration(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
-    var global = try parseVariable(gpa, current.currentChunk(), parser, scanner, current, "Expect variable name.");
+    var global = try parseVariable(gpa, parser, scanner, current, "Expect variable name.");
 
     if (matchP(TokenType.EQUAL, parser, scanner)) {
         expression(gpa, parser, scanner, current);
@@ -200,13 +209,13 @@ fn varDeclaration(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, cu
     try defineVariable(global, current);
 }
 
-fn parseVariable(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner: *Scanner, current: *Compiler, errorMessage: []const u8) !usize {
+fn parseVariable(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler, errorMessage: []const u8) !usize {
     consumeP(parser, scanner, TokenType.IDENTIFIER, errorMessage);
 
     try declareVariable(scanner, parser, current);
     if (current.scopeDepth > 0) return 0;
 
-    return try identifierConstant(gpa, parser.previous, currentChunk, scanner.buf);
+    return try identifierConstant(gpa, parser.previous, current.currentChunk(), scanner.buf);
 }
 
 fn identifierConstant(gpa: std.mem.Allocator, name: Token, currentChunk: *Chunk, buf: []const u8) !u8 {
@@ -315,6 +324,49 @@ fn block(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, compiler: *
     }
 
     consumeP(parser, scanner, TokenType.RIGHT_BRACE, "Expect '}' after block.");
+}
+
+fn function(gpa: std.mem.Allocator, funtyp: FunctionType, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
+    const chk = Chunk{ .data = std.ArrayList(u8).init(gpa), .constants = std.ArrayList(Value).init(gpa), .line = 0 };
+    var fun = try gpa.create(Function);
+    fun.* = Function{ .arity = 0, .chunk = chk, .name = "" };
+    var compiler = try gpa.create(Compiler);
+    compiler.* = Compiler{ .enclosing = current, .function_type = funtyp, .function = fun, .locals = std.ArrayList(Local).init(gpa), .scopeDepth = 0 };
+
+    if (funtyp != FunctionType.script) {
+        const dst = try gpa.alloc(u8, parser.previous.length);
+        std.mem.copy(u8, dst, scanner.buf[parser.previous.start .. parser.previous.start + parser.previous.length]);
+        compiler.function.name = dst;
+    }
+
+    var local = Local{ .depth = 0, .name = Token{ .line = 0, .typ = TokenType.ERROR, .start = 0, .length = 0 } };
+    try compiler.locals.append(local);
+
+    compiler.beginScope();
+    consumeP(parser, scanner, TokenType.LEFT_PAREN, "Expect '(' after fun name.");
+    if (!check(TokenType.RIGHT_PAREN, parser)) {
+        while (true) {
+            // using compiler instead of current since initCompiler in chapter 24
+            // overwrites current with the passed in compiler
+            // so by this point, current would be the compiler, not the old one
+            compiler.function.arity += 1;
+            if (compiler.function.arity > 255) {
+                @panic("Can't have more than 255 parameters.");
+            }
+            const constant = try parseVariable(gpa, parser, scanner, compiler, "Expect parameter name.");
+            try defineVariable(constant, compiler);
+            if (!matchP(TokenType.COMMA, parser, scanner)) break;
+        }
+    }
+    consumeP(parser, scanner, TokenType.RIGHT_PAREN, "Expect ')' after fun params.");
+    consumeP(parser, scanner, TokenType.LEFT_BRACE, "Expect '{' before fun body.");
+    block(gpa, parser, scanner, compiler);
+
+    const finished = try compiler.endCompiler(); // this overwrites compiler's contents with the enclosing compiler
+    const chunk = compiler.currentChunk();
+    try chunk.data.append(@intFromEnum(Op.CONSTANT));
+    try chunk.constants.append(Value{ .function = finished });
+    try chunk.data.append(@truncate(u8, chunk.constants.items.len) - 1);
 }
 
 fn expressionStatement(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
@@ -678,6 +730,7 @@ const FunctionType = enum {
 };
 
 const Compiler = struct {
+    enclosing: ?*Compiler,
     function: *Function,
     function_type: FunctionType,
 
@@ -700,12 +753,20 @@ const Compiler = struct {
     }
 
     fn markInitialized(current: *Compiler) void {
+        if (current.scopeDepth == 0) return;
         var last = current.locals.items.len - 1;
         current.locals.items[last].depth = current.scopeDepth;
     }
 
     fn currentChunk(current: *Compiler) *Chunk {
         return &current.function.chunk;
+    }
+
+    fn endCompiler(current: *Compiler) !*Function {
+        try current.currentChunk().data.append(@intFromEnum(Op.RETURN));
+        const fun = current.function;
+        current.* = current.enclosing.?.*;
+        return fun;
     }
 };
 
@@ -725,7 +786,7 @@ pub fn main() !void {
     var scanner = Scanner{ .start = 0, .current = 0, .line = 1, .buf = file_buffer };
     var compilingChunk = Chunk{ .data = std.ArrayList(u8).init(gpa), .constants = std.ArrayList(Value).init(gpa), .line = 1 };
     var fun = Function{ .arity = 0, .chunk = compilingChunk, .name = "<script>" };
-    var compiler = Compiler{ .function = &fun, .function_type = FunctionType.script, .locals = std.ArrayList(Local).init(gpa), .scopeDepth = 0 };
+    var compiler = Compiler{ .enclosing = null, .function = &fun, .function_type = FunctionType.script, .locals = std.ArrayList(Local).init(gpa), .scopeDepth = 0 };
     var parser: Parser = undefined;
 
     advanceP(&parser, &scanner);
@@ -751,7 +812,7 @@ pub fn main() !void {
         .stackTop = 0,
     };
     vm.stackTop += 1;
-    vm.stack[vm.stackTop] = Value{ .function = fun };
+    vm.stack[vm.stackTop] = Value{ .function = &fun };
     try vm.frames.append(CallFrame{ .ip = 0, .slots = &vm.stack, .function = &fun });
     try runChunk(gpa, &vm);
     vm.stackTop = 0;
