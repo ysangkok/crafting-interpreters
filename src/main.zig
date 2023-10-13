@@ -40,6 +40,7 @@ const ValueTag = enum {
     nil,
     string,
     function,
+    closure,
 };
 
 const Function = struct {
@@ -54,10 +55,16 @@ const Value = union(ValueTag) {
     nil: void,
     string: []u8,
     function: *Function,
+    closure: *Closure,
+};
+
+const Closure = struct {
+    obj: Value,
+    function: *Function,
 };
 
 const CallFrame = struct {
-    function: *Function,
+    closure: *Closure,
     ip: usize,
     slotsOffset: usize,
 };
@@ -65,8 +72,18 @@ const CallFrame = struct {
 const red = "\x1b[31m";
 const reset_sequence = "\x1b[0m";
 
+fn newClosure(gpa: std.mem.Allocator, fun: *Function) !*Closure {
+    const closure = try gpa.create(Closure);
+    closure.function = fun;
+    return closure;
+}
+
 fn printValue(stdout: anytype, val: Value) !void {
     switch (val) {
+        .closure => |clj| {
+            try stdout.print("closure: ", .{});
+            try printValue(stdout, Value{ .function = clj.function });
+        },
         .number => |num| try stdout.print("printValue: {s}{d}{s}\n", .{ red, num, reset_sequence }),
         .boolean => |boo| try stdout.print("printValue: {s}{}{s}\n", .{ red, boo, reset_sequence }),
         .string => |str| try stdout.print("printValue: {s}{s}{s}\n", .{ red, str, reset_sequence }),
@@ -367,7 +384,7 @@ fn function(gpa: std.mem.Allocator, funtyp: FunctionType, parser: *Parser, scann
 
     const finished = try compiler.endCompiler(); // this overwrites compiler's contents with the enclosing compiler
     const chunk = compiler.currentChunk();
-    try chunk.data.append(@intFromEnum(Op.CONSTANT));
+    try chunk.data.append(@intFromEnum(Op.CLOSURE));
     try chunk.constants.append(Value{ .function = finished });
     try chunk.data.append(@truncate(u8, chunk.constants.items.len) - 1);
 }
@@ -752,13 +769,18 @@ fn disassembleChunk(gpa: std.mem.Allocator, chunks: *std.MultiArrayList(Chunk)) 
                 try stdout.print("constant {d} {s}\n", .{ constidx, try showVal(gpa, chunks.items(.constants)[idx].items[constidx]) });
             }
             switch (o) {
-                .GET_LOCAL, .SET_LOCAL, .SET_GLOBAL, .GET_GLOBAL, .CONSTANT, .DEFINE_GLOBAL, .CALL => {
+                .GET_LOCAL, .SET_LOCAL, .SET_GLOBAL, .GET_GLOBAL, .CONSTANT, .DEFINE_GLOBAL, .CALL, .CLOSURE => {
                     opidx += 1;
                 },
                 .JUMP, .JUMP_IF_FALSE, .LOOP => {
                     opidx += 2;
                 },
-                else => {},
+                .POP => {},
+                else => {
+                    try stdout.print("{s}: ", .{@tagName(o)});
+                    try bw.flush();
+                    @panic("bad instruction in disassembler");
+                },
             }
         }
         try bw.flush();
@@ -858,11 +880,12 @@ pub fn main() !void {
         .stack = undefined,
         .stackTop = 0,
     };
+    const clj = try newClosure(gpa, &fun);
     vm.stackTop += 1;
-    vm.stack[vm.stackTop] = Value{ .function = &fun };
+    vm.stack[vm.stackTop] = Value{ .closure = clj };
 
     //try vm.frames.append(CallFrame{ .ip = 0, .slots = &vm.stack, .function = &fun });
-    _ = try call(&fun, 0, &vm);
+    _ = try call(clj, 0, &vm);
 
     try runChunk(gpa, &vm);
     vm.stackTop = 0;
@@ -937,6 +960,13 @@ const VM = struct {
     stack: [256]Value,
 };
 
+fn get_function(val: Value) !*Function {
+    switch (val) {
+        .function => |fun| return fun,
+        else => @panic("not a function"),
+    }
+}
+
 fn get_number(val: Value) !f64 {
     switch (val) {
         .number => |num| return num,
@@ -966,6 +996,7 @@ fn valuesEqual(a: Value, b: Value) bool {
         .number => |num| return num == b.number,
         .string => |str| return std.mem.eql(u8, str, b.string),
         .function => |_| return false,
+        .closure => |_| return false,
     }
 }
 
@@ -991,6 +1022,7 @@ fn showVal(gpa: std.mem.Allocator, val: Value) ![]const u8 {
         },
         .string => |str| return str,
         .function => |fun| return try std.fmt.allocPrint(gpa, "<fn {s}>", .{fun.name}),
+        .closure => |clj| return try std.fmt.allocPrint(gpa, "<closure {s}>", .{clj.function.name}),
     }
 }
 
@@ -1004,7 +1036,7 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
     var lst: Op = undefined;
     var frame: *CallFrame = &vm.frames.items[vm.frames.items.len - 1];
     while (true) {
-        const chunk: *Chunk = &frame.function.chunk;
+        const chunk: *Chunk = &frame.closure.function.chunk;
         if (frame.ip >= chunk.data.items.len) {
             //try stdout.print("breaking, ip out of range {d} {d}\n", .{ frame.ip, chunk.data.items.len });
             break;
@@ -1084,6 +1116,14 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
                 try stdout.print("negate: old={d} res={d}, stackTop={d} \n", .{ old, res, vm.stackTop });
                 vm.stack[vm.stackTop] = Value{ .number = res };
             },
+            .CLOSURE => {
+                const fun: *Function = try get_function(chunk.constants.items[@as(usize, chunk.data.items[frame.ip])]);
+                frame.ip += 1;
+                const clj: *Closure = try newClosure(gpa, fun);
+
+                vm.stackTop += 1;
+                vm.stack[vm.stackTop] = Value{ .closure = clj };
+            },
             .RETURN => {
                 try stdout.print("return: {s} read from stackTop={d}\n", .{ try showVal(gpa, vm.stack[vm.stackTop]), vm.stackTop });
 
@@ -1141,6 +1181,9 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
                     },
                     .function => |_| {
                         @panic("invalid function for + operator");
+                    },
+                    .closure => |_| {
+                        @panic("invalid closure for + operator");
                     },
                 }
             },
@@ -1244,20 +1287,19 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
     try bw.flush();
 }
 
-fn call(fun: *Function, argCount: u8, vm: *VM) !bool {
-    if (argCount != fun.arity) {
+fn call(clj: *Closure, argCount: u8, vm: *VM) !bool {
+    if (argCount != clj.function.arity) {
         @panic("function arity mismatch");
     }
-    var frame = CallFrame{ .function = fun, .ip = 0, .slotsOffset = vm.stackTop - argCount - 1 };
+    var frame = CallFrame{ .closure = clj, .ip = 0, .slotsOffset = vm.stackTop - argCount - 1 };
     try vm.frames.append(frame);
     return true;
 }
 
 fn callValue(callee: Value, argCount: u8, vm: *VM) !bool {
     switch (callee) {
-        .function => |fun| {
-            //std.debug.print("calling {s}\n", .{fun.name});
-            return try call(fun, argCount, vm);
+        .closure => |clj| {
+            return try call(clj, argCount, vm);
         },
         else => return false,
     }
@@ -1300,6 +1342,7 @@ const Op = enum(u8) {
     DIVIDE,
     NOT,
     NEGATE,
+    CLOSURE,
     RETURN,
     PRINT,
     JUMP,
