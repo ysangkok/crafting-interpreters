@@ -41,10 +41,12 @@ const ValueTag = enum {
     string,
     function,
     closure,
+    upvalue,
 };
 
 const Function = struct {
     arity: u8,
+    upvalueCount: u8,
     chunk: Chunk,
     name: []const u8,
 };
@@ -56,10 +58,17 @@ const Value = union(ValueTag) {
     string: []u8,
     function: *Function,
     closure: *Closure,
+    upvalue: *ObjUpvalue,
+};
+
+const ObjUpvalue = struct {
+    location: *Value,
+    //next: *
 };
 
 const Closure = struct {
     obj: Value,
+    upvalues: std.ArrayList(?*ObjUpvalue),
     function: *Function,
 };
 
@@ -72,9 +81,17 @@ const CallFrame = struct {
 const red = "\x1b[31m";
 const reset_sequence = "\x1b[0m";
 
+fn newUpvalue(gpa: std.mem.Allocator, value: *Value) !*ObjUpvalue {
+    const up: *ObjUpvalue = try gpa.create(ObjUpvalue);
+    up.location = value;
+    return up;
+}
+
 fn newClosure(gpa: std.mem.Allocator, fun: *Function) !*Closure {
     const closure = try gpa.create(Closure);
     closure.function = fun;
+    closure.upvalues = std.ArrayList(?*ObjUpvalue).init(gpa);
+    for (0..fun.upvalueCount) |_| try closure.upvalues.append(null);
     return closure;
 }
 
@@ -89,6 +106,7 @@ fn printValue(stdout: anytype, val: Value) !void {
         .string => |str| try stdout.print("printValue: {s}{s}{s}\n", .{ red, str, reset_sequence }),
         .nil => try stdout.print("printValue: {s}nil{s}\n", .{ red, reset_sequence }),
         .function => |_| try stdout.print("printValue: {s}function{s}\n", .{ red, reset_sequence }),
+        .upvalue => |_| try stdout.print("printValue: {s}upvalue{s}\n", .{ red, reset_sequence }),
     }
 }
 
@@ -349,9 +367,9 @@ fn block(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, compiler: *
 fn function(gpa: std.mem.Allocator, funtyp: FunctionType, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
     const chk = Chunk{ .data = std.ArrayList(u8).init(gpa), .constants = std.ArrayList(Value).init(gpa), .line = 0 };
     var fun = try gpa.create(Function);
-    fun.* = Function{ .arity = 0, .chunk = chk, .name = "" };
+    fun.* = Function{ .arity = 0, .upvalueCount = 0, .chunk = chk, .name = "" };
     var compiler = try gpa.create(Compiler);
-    compiler.* = Compiler{ .enclosing = current, .function_type = funtyp, .function = fun, .locals = std.ArrayList(Local).init(gpa), .scopeDepth = 0 };
+    compiler.* = Compiler{ .upvalues = undefined, .enclosing = current, .function_type = funtyp, .function = fun, .locals = std.ArrayList(Local).init(gpa), .scopeDepth = 0 };
 
     if (funtyp != FunctionType.script) {
         const dst = try gpa.alloc(u8, parser.previous.length);
@@ -387,6 +405,16 @@ fn function(gpa: std.mem.Allocator, funtyp: FunctionType, parser: *Parser, scann
     try chunk.data.append(@intFromEnum(Op.CLOSURE));
     try chunk.constants.append(Value{ .function = finished });
     try chunk.data.append(@truncate(u8, chunk.constants.items.len) - 1);
+
+    for (0..finished.upvalueCount) |idx| {
+        const upvalue = compiler.upvalues[idx];
+        if (upvalue.isLocal) {
+            try chunk.data.append(1);
+        } else {
+            try chunk.data.append(0);
+        }
+        try chunk.data.append(upvalue.index);
+    }
 }
 
 fn expressionStatement(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
@@ -632,10 +660,17 @@ fn namedVariable(name: Token, gpa: std.mem.Allocator, parser: *Parser, scanner: 
         getOp = Op.GET_LOCAL;
         setOp = Op.SET_LOCAL;
     } else {
-        std.debug.print("namedVariable: global\n", .{});
-        arg = try identifierConstant(gpa, name, currentChunk, scanner.buf);
-        getOp = Op.GET_GLOBAL;
-        setOp = Op.SET_GLOBAL;
+        const argu: ?u8 = resolveUpvalue(scanner, current, &name);
+        if (argu != null) {
+            arg = argu.?;
+            getOp = Op.GET_UPVALUE;
+            setOp = Op.SET_UPVALUE;
+        } else {
+            std.debug.print("namedVariable: global\n", .{});
+            arg = try identifierConstant(gpa, name, currentChunk, scanner.buf);
+            getOp = Op.GET_GLOBAL;
+            setOp = Op.SET_GLOBAL;
+        }
     }
 
     if (canAssign and matchP(TokenType.EQUAL, parser, scanner)) {
@@ -670,6 +705,40 @@ fn resolveLocal(scanner: *Scanner, compiler: *Compiler, name: *const Token) i16 
     }
 
     return -1;
+}
+
+fn addUpvalue(compiler: *Compiler, index: u8, isLocal: bool) u8 {
+    const new = Upvalue{ .isLocal = isLocal, .index = index };
+
+    const upvalueCount = compiler.function.upvalueCount;
+    for (0..upvalueCount) |idx| {
+        const upval = compiler.upvalues[idx];
+        if (upval.index == new.index and upval.isLocal == new.isLocal) return @truncate(u8, idx);
+    }
+    compiler.upvalues[upvalueCount].isLocal = isLocal;
+    compiler.upvalues[upvalueCount].index = index;
+
+    compiler.function.upvalueCount += 1;
+    return compiler.function.upvalueCount - 1;
+}
+
+fn resolveUpvalue(scanner: *Scanner, compiler: *Compiler, name: *const Token) ?u8 {
+    if (compiler.enclosing == null) {
+        // must be a global
+        return null;
+    }
+
+    const local = resolveLocal(scanner, compiler.enclosing.?, name);
+    if (local != -1) {
+        return addUpvalue(compiler, @intCast(u8, local), true);
+    }
+
+    const upvalue = resolveUpvalue(scanner, compiler.enclosing.?, name);
+    if (upvalue != null) {
+        return addUpvalue(compiler, upvalue.?, false);
+    }
+
+    return null;
 }
 
 fn panicToken(tokenType: TokenType) noreturn {
@@ -769,8 +838,21 @@ fn disassembleChunk(gpa: std.mem.Allocator, chunks: *std.MultiArrayList(Chunk)) 
                 try stdout.print("constant {d} {s}\n", .{ constidx, try showVal(gpa, chunks.items(.constants)[idx].items[constidx]) });
             }
             switch (o) {
-                .GET_LOCAL, .SET_LOCAL, .SET_GLOBAL, .GET_GLOBAL, .CONSTANT, .DEFINE_GLOBAL, .CALL, .CLOSURE => {
+                .GET_LOCAL, .SET_LOCAL, .SET_GLOBAL, .GET_GLOBAL, .CONSTANT, .DEFINE_GLOBAL, .CALL, .GET_UPVALUE, .SET_UPVALUE => {
                     opidx += 1;
+                },
+                .CLOSURE => {
+                    opidx += 1;
+                    const constidx = opdata.items[opidx];
+                    const fun = try get_function(chunks.items(.constants)[idx].items[constidx]);
+                    try stdout.print("op idx {d}: reading function from constant idx {d}: upvalueCount: {d}\n", .{ opidx, constidx, fun.upvalueCount });
+                    for (0..fun.upvalueCount) |_| {
+                        opidx += 1;
+                        const isLocal = opdata.items[opidx];
+                        opidx += 1;
+                        const index = opdata.items[opidx];
+                        try stdout.print("{d} {d}\n", .{ isLocal, index });
+                    }
                 },
                 .JUMP, .JUMP_IF_FALSE, .LOOP => {
                     opidx += 2;
@@ -792,6 +874,11 @@ const Local = struct {
     depth: i16,
 };
 
+const Upvalue = struct {
+    index: u8,
+    isLocal: bool,
+};
+
 const FunctionType = enum {
     function,
     script,
@@ -803,6 +890,7 @@ const Compiler = struct {
     function_type: FunctionType,
 
     locals: std.ArrayList(Local),
+    upvalues: [256]Upvalue,
     scopeDepth: u8,
 
     fn beginScope(this: *Compiler) void {
@@ -854,8 +942,8 @@ pub fn main() !void {
 
     var scanner = Scanner{ .start = 0, .current = 0, .line = 1, .buf = file_buffer };
     var compilingChunk = Chunk{ .data = std.ArrayList(u8).init(gpa), .constants = std.ArrayList(Value).init(gpa), .line = 1 };
-    var fun = Function{ .arity = 0, .chunk = compilingChunk, .name = "<script>" };
-    var compiler = Compiler{ .enclosing = null, .function = &fun, .function_type = FunctionType.script, .locals = std.ArrayList(Local).init(gpa), .scopeDepth = 0 };
+    var fun = Function{ .arity = 0, .upvalueCount = 0, .chunk = compilingChunk, .name = "<script>" };
+    var compiler = Compiler{ .upvalues = undefined, .enclosing = null, .function = &fun, .function_type = FunctionType.script, .locals = std.ArrayList(Local).init(gpa), .scopeDepth = 0 };
     var parser: Parser = undefined;
 
     advanceP(&parser, &scanner);
@@ -997,6 +1085,7 @@ fn valuesEqual(a: Value, b: Value) bool {
         .string => |str| return std.mem.eql(u8, str, b.string),
         .function => |_| return false,
         .closure => |_| return false,
+        .upvalue => |_| return false,
     }
 }
 
@@ -1023,6 +1112,7 @@ fn showVal(gpa: std.mem.Allocator, val: Value) ![]const u8 {
         .string => |str| return str,
         .function => |fun| return try std.fmt.allocPrint(gpa, "<fn {s}>", .{fun.name}),
         .closure => |clj| return try std.fmt.allocPrint(gpa, "<closure {s}>", .{clj.function.name}),
+        .upvalue => |_| return "upvalue",
     }
 }
 
@@ -1065,6 +1155,17 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
             .FALSE => {
                 vm.stackTop += 1;
                 vm.stack[vm.stackTop] = Value{ .boolean = false };
+            },
+            .GET_UPVALUE => {
+                const slot = chunk.data.items[frame.ip];
+                frame.ip += 1;
+                vm.stackTop += 1;
+                vm.stack[vm.stackTop] = frame.closure.upvalues.items[slot].?.location.*;
+            },
+            .SET_UPVALUE => {
+                const slot = chunk.data.items[frame.ip];
+                frame.ip += 1;
+                frame.closure.upvalues.items[slot].?.location.* = vm.stack[vm.stackTop];
             },
             .EQUAL => {
                 const b = vm.stack[vm.stackTop - 0];
@@ -1123,6 +1224,21 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
 
                 vm.stackTop += 1;
                 vm.stack[vm.stackTop] = Value{ .closure = clj };
+
+                std.debug.print("run time upvalues count: {d}\n", .{clj.upvalues.items.len});
+                for (0..clj.upvalues.items.len) |i| {
+                    const isLocal = chunk.data.items[frame.ip];
+                    frame.ip += 1;
+                    const index = chunk.data.items[frame.ip];
+                    frame.ip += 1;
+                    std.debug.print("isLocal: {d}, index at chunk->code idx {d}: {d}\n", .{ isLocal, frame.ip - 1, index });
+                    if (isLocal == 1) {
+                        clj.upvalues.items[i] = try captureUpvalue(gpa, &vm.stack[frame.slotsOffset + index]);
+                    } else {
+                        std.debug.print("reading from frame upvalues, which has length {d}\n", .{frame.closure.upvalues.items.len});
+                        clj.upvalues.items[i] = frame.closure.upvalues.items[index];
+                    }
+                }
             },
             .RETURN => {
                 try stdout.print("return: {s} read from stackTop={d}\n", .{ try showVal(gpa, vm.stack[vm.stackTop]), vm.stackTop });
@@ -1184,6 +1300,9 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
                     },
                     .closure => |_| {
                         @panic("invalid closure for + operator");
+                    },
+                    .upvalue => |_| {
+                        @panic("invalid upvalue for + operator");
                     },
                 }
             },
@@ -1305,6 +1424,11 @@ fn callValue(callee: Value, argCount: u8, vm: *VM) !bool {
     }
 }
 
+fn captureUpvalue(gpa: std.mem.Allocator, local: *Value) !*ObjUpvalue {
+    const createdUpvalue: *ObjUpvalue = try newUpvalue(gpa, local);
+    return createdUpvalue;
+}
+
 fn concatAndReturnBuffer(allocator: std.mem.Allocator, one: []const u8, two: []const u8) ![]u8 {
     var b = try allocator.alloc(u8, one.len + two.len);
     std.mem.copy(u8, b, one);
@@ -1353,6 +1477,8 @@ const Op = enum(u8) {
     DEFINE_GLOBAL,
     GET_GLOBAL,
     SET_GLOBAL,
+    GET_UPVALUE,
+    SET_UPVALUE,
     GET_LOCAL,
     SET_LOCAL,
 };
