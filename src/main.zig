@@ -97,10 +97,7 @@ fn newClosure(gpa: std.mem.Allocator, fun: *Function) !*Closure {
 
 fn printValue(stdout: anytype, val: Value) !void {
     switch (val) {
-        .closure => |clj| {
-            try stdout.print("closure: ", .{});
-            try printValue(stdout, Value{ .function = clj.function });
-        },
+        .closure => |clj| try stdout.print("printValue: {s}<closure {s}>{s}\n", .{ red, clj.function.name, reset_sequence }),
         .number => |num| try stdout.print("printValue: {s}{d}{s}\n", .{ red, num, reset_sequence }),
         .boolean => |boo| try stdout.print("printValue: {s}{}{s}\n", .{ red, boo, reset_sequence }),
         .string => |str| try stdout.print("printValue: {s}{s}{s}\n", .{ red, str, reset_sequence }),
@@ -400,21 +397,24 @@ fn function(gpa: std.mem.Allocator, funtyp: FunctionType, parser: *Parser, scann
     consumeP(parser, scanner, TokenType.LEFT_BRACE, "Expect '{' before fun body.");
     block(gpa, parser, scanner, compiler);
 
+    const buf = try gpa.alloc(u8, 2 * fun.upvalueCount);
+    for (0..fun.upvalueCount) |idx| {
+        const upvalue: *Upvalue = &compiler.upvalues[idx];
+        std.debug.print("wrote upvalue {*}: {d}\n", .{ upvalue, upvalue.index });
+        if (upvalue.isLocal) {
+            buf[idx * 2] = 1;
+        } else {
+            buf[idx * 2] = 0;
+        }
+        buf[idx * 2 + 1] = upvalue.index;
+    }
     const finished = try compiler.endCompiler(); // this overwrites compiler's contents with the enclosing compiler
     const chunk = compiler.currentChunk();
     try chunk.data.append(@intFromEnum(Op.CLOSURE));
     try chunk.constants.append(Value{ .function = finished });
     try chunk.data.append(@truncate(u8, chunk.constants.items.len) - 1);
 
-    for (0..finished.upvalueCount) |idx| {
-        const upvalue = compiler.upvalues[idx];
-        if (upvalue.isLocal) {
-            try chunk.data.append(1);
-        } else {
-            try chunk.data.append(0);
-        }
-        try chunk.data.append(upvalue.index);
-    }
+    try chunk.data.appendSlice(buf);
 }
 
 fn expressionStatement(gpa: std.mem.Allocator, parser: *Parser, scanner: *Scanner, current: *Compiler) !void {
@@ -708,17 +708,29 @@ fn resolveLocal(scanner: *Scanner, compiler: *Compiler, name: *const Token) i16 
 }
 
 fn addUpvalue(compiler: *Compiler, index: u8, isLocal: bool) u8 {
+    const stdout_file = std.io.getStdOut().writer();
+    var bw = std.io.bufferedWriter(stdout_file);
+    const stdout = bw.writer();
+
     const new = Upvalue{ .isLocal = isLocal, .index = index };
 
     const upvalueCount = compiler.function.upvalueCount;
     for (0..upvalueCount) |idx| {
         const upval = compiler.upvalues[idx];
-        if (upval.index == new.index and upval.isLocal == new.isLocal) return @truncate(u8, idx);
+        if (upval.index == new.index and upval.isLocal == new.isLocal) {
+            //if (upval.index == 170) @panic("early return");
+            return @truncate(u8, idx);
+        }
     }
+    //if (index == 170) @panic("one seventy");
     compiler.upvalues[upvalueCount].isLocal = isLocal;
     compiler.upvalues[upvalueCount].index = index;
 
     compiler.function.upvalueCount += 1;
+    if (true) {
+        stdout.print("{*} index set to {d}\n", .{ &compiler.upvalues[upvalueCount], index }) catch {};
+        bw.flush() catch {};
+    }
     return compiler.function.upvalueCount - 1;
 }
 
@@ -1137,7 +1149,7 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
             break;
         }
         const op = @enumFromInt(Op, chunk.data.items[frame.ip]);
-        try stdout.print("executing ip={d}\n", .{frame.ip});
+        try stdout.print("executing ip={d}, op={s}\n", .{ frame.ip, @tagName(op) });
         //try stdout.print("stack elem 0: ", .{});
         //try printValue(stdout, vm.stack[0]);
         //try stdout.print("stack elem 1: ", .{});
@@ -1146,6 +1158,10 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
         //try printValue(stdout, vm.stack[2]);
         //try stdout.print("stack elem 3: ", .{});
         //try printValue(stdout, vm.stack[3]);
+        //try stdout.print("stack elem 4: ", .{});
+        //try printValue(stdout, vm.stack[4]);
+        //try stdout.print("stack elem 5: ", .{});
+        //try printValue(stdout, vm.stack[5]);
         frame.ip += 1;
         lst = op;
         switch (op) {
@@ -1166,11 +1182,14 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
                 frame.ip += 1;
                 vm.stackTop += 1;
                 vm.stack[vm.stackTop] = frame.closure.upvalues.items[slot].?.location.*;
+                try stdout.print("got upvalue from slot {d}, saved at {d}: {s}\n", .{ slot, vm.stackTop, try showVal(gpa, vm.stack[vm.stackTop]) });
             },
             .SET_UPVALUE => {
                 const slot = chunk.data.items[frame.ip];
                 frame.ip += 1;
                 frame.closure.upvalues.items[slot].?.location.* = vm.stack[vm.stackTop];
+                try stdout.print("set upvalue, saved from stack position {d} at slot={d}: {s}\n", .{ vm.stackTop, slot, try showVal(gpa, vm.stack[vm.stackTop]) });
+                //vm.stackTop -= 1;
             },
             .EQUAL => {
                 const b = vm.stack[vm.stackTop - 0];
@@ -1223,25 +1242,27 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
                 vm.stack[vm.stackTop] = Value{ .number = res };
             },
             .CLOSURE => {
-                const fun: *Function = try get_function(chunk.constants.items[@as(usize, chunk.data.items[frame.ip])]);
-                std.debug.print("executing closure: got function: {s}\n", .{fun.name});
+                const constidx = @as(usize, chunk.data.items[frame.ip]);
+                const fun: *Function = try get_function(chunk.constants.items[constidx]);
+                try stdout.print("executing closure: got function from ip {d} and constant index {d}: {s}\n", .{ frame.ip, constidx, fun.name });
+                //_ = try disassClosure(chunk.data.items[frame.ip..], chunk.constants.items);
                 frame.ip += 1;
                 const clj: *Closure = try newClosure(gpa, fun);
 
                 vm.stackTop += 1;
                 vm.stack[vm.stackTop] = Value{ .closure = clj };
 
-                std.debug.print("run time upvalues count: {d}\n", .{clj.upvalues.items.len});
+                try stdout.print("run time upvalues count: {d}\n", .{clj.upvalues.items.len});
                 for (0..clj.upvalues.items.len) |i| {
                     const isLocal = chunk.data.items[frame.ip];
                     frame.ip += 1;
                     const index = chunk.data.items[frame.ip];
                     frame.ip += 1;
-                    std.debug.print("isLocal: {d}, index at chunk->code idx {d}: {d}\n", .{ isLocal, frame.ip - 1, index });
+                    try stdout.print("isLocal: {d}, index at chunk->code idx {d}: {d}\n", .{ isLocal, frame.ip - 1, index });
                     if (isLocal == 1) {
-                        clj.upvalues.items[i] = try captureUpvalue(gpa, &vm.stack[frame.slotsOffset + index]);
+                        clj.upvalues.items[i] = try captureUpvalue(gpa, &vm.stack[frame.slotsOffset + index + 1]);
                     } else {
-                        std.debug.print("reading from frame upvalues, which has length {d}\n", .{frame.closure.upvalues.items.len});
+                        try stdout.print("reading from frame upvalues, which has length {d}\n", .{frame.closure.upvalues.items.len});
                         clj.upvalues.items[i] = frame.closure.upvalues.items[index];
                     }
                 }
