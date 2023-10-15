@@ -817,56 +817,61 @@ fn infix(gpa: std.mem.Allocator, currentChunk: *Chunk, parser: *Parser, scanner:
     }
 }
 
-fn disassembleChunk(gpa: std.mem.Allocator, chunks: *std.MultiArrayList(Chunk)) !void {
+fn disassClosure(opdata: []const u8, constants: []const Value) !usize {
     const stdout_file = std.io.getStdOut().writer();
     var bw = std.io.bufferedWriter(stdout_file);
     const stdout = bw.writer();
-    const data = chunks.items(.data);
-    var idx: usize = 0;
-    while (idx < data.len) : (idx += 1) {
-        const opdata = data[idx];
-        try stdout.print("processing idx idx={d} data.len={d} opdata.items.len={d}\n", .{ idx, data.len, opdata.items.len });
-        //const openum = @enumFromInt(Op, opdata.items[0]);
-        var opidx: usize = 0;
-        while (opidx < opdata.items.len) : (opidx += 1) {
-            const op = opdata.items[opidx];
-            try stdout.print("idx idx={d} op={d} tag={s} len={d}\n", .{ opidx, op, @tagName(@enumFromInt(Op, op)), opdata.items.len });
-            const o = @enumFromInt(Op, op);
-            if (o == Op.CONSTANT) {
-                const constidx = opdata.items[opidx + 1];
-                try bw.flush();
-                try stdout.print("constant {d} {s}\n", .{ constidx, try showVal(gpa, chunks.items(.constants)[idx].items[constidx]) });
-            }
-            switch (o) {
-                .GET_LOCAL, .SET_LOCAL, .SET_GLOBAL, .GET_GLOBAL, .CONSTANT, .DEFINE_GLOBAL, .CALL, .GET_UPVALUE, .SET_UPVALUE => {
-                    opidx += 1;
-                },
-                .CLOSURE => {
-                    opidx += 1;
-                    const constidx = opdata.items[opidx];
-                    const fun = try get_function(chunks.items(.constants)[idx].items[constidx]);
-                    try stdout.print("op idx {d}: reading function from constant idx {d}: upvalueCount: {d}\n", .{ opidx, constidx, fun.upvalueCount });
-                    for (0..fun.upvalueCount) |_| {
-                        opidx += 1;
-                        const isLocal = opdata.items[opidx];
-                        opidx += 1;
-                        const index = opdata.items[opidx];
-                        try stdout.print("{d} {d}\n", .{ isLocal, index });
-                    }
-                },
-                .JUMP, .JUMP_IF_FALSE, .LOOP => {
-                    opidx += 2;
-                },
-                .POP => {},
-                else => {
-                    try stdout.print("{s}: ", .{@tagName(o)});
-                    try bw.flush();
-                    @panic("bad instruction in disassembler");
-                },
-            }
-        }
-        try bw.flush();
+
+    var opidx: usize = 0;
+    const constidx = opdata[opidx];
+    opidx += 1;
+    const fun = try get_function(constants[constidx]);
+    try stdout.print("op idx: reading function {s} from constant idx {d}: upvalueCount: {d}\n", .{ fun.name, constidx, fun.upvalueCount });
+    for (0..fun.upvalueCount) |_| {
+        const isLocal = opdata[opidx];
+        opidx += 1;
+        const index = opdata[opidx];
+        opidx += 1;
+        try stdout.print("{d} {d}\n", .{ isLocal, index });
     }
+    return opidx;
+}
+
+fn disassembleChunk(gpa: std.mem.Allocator, opdata: []const u8, constants: []const Value) !void {
+    const stdout_file = std.io.getStdOut().writer();
+    var bw = std.io.bufferedWriter(stdout_file);
+    const stdout = bw.writer();
+
+    var opidx: usize = 0;
+    while (opidx < opdata.len) : (opidx += 1) {
+        const op = opdata[opidx];
+        try stdout.print("idx idx={d} op={d} tag={s} len={d}\n", .{ opidx, op, @tagName(@enumFromInt(Op, op)), opdata.len });
+        const o = @enumFromInt(Op, op);
+        if (o == Op.CONSTANT) {
+            const constidx = opdata[opidx + 1];
+            try bw.flush();
+            try stdout.print("constant {d} {s}\n", .{ constidx, try showVal(gpa, constants[constidx]) });
+        }
+        switch (o) {
+            .GET_LOCAL, .SET_LOCAL, .SET_GLOBAL, .GET_GLOBAL, .CONSTANT, .DEFINE_GLOBAL, .CALL, .GET_UPVALUE, .SET_UPVALUE => {
+                opidx += 1;
+            },
+            .CLOSURE => {
+                const incr = try disassClosure(opdata[opidx + 1 ..], constants);
+                opidx += incr;
+            },
+            .JUMP, .JUMP_IF_FALSE, .LOOP => {
+                opidx += 2;
+            },
+            .POP => {},
+            else => {
+                try stdout.print("{s}: ", .{@tagName(o)});
+                try bw.flush();
+                @panic("bad instruction in disassembler");
+            },
+        }
+    }
+    try bw.flush();
 }
 
 const Local = struct {
@@ -961,7 +966,7 @@ pub fn main() !void {
         var chk = compiler.currentChunk();
         try chunks.append(gpa, chk.*);
         //try stdout.print("chunks: {d}\n", .{chunks.len});
-        try disassembleChunk(gpa, &chunks);
+        try disassembleChunk(gpa, chk.data.items, chk.constants.items);
     }
     var vm = VM{
         .frames = std.ArrayList(CallFrame).init(gpa),
@@ -1219,6 +1224,7 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
             },
             .CLOSURE => {
                 const fun: *Function = try get_function(chunk.constants.items[@as(usize, chunk.data.items[frame.ip])]);
+                std.debug.print("executing closure: got function: {s}\n", .{fun.name});
                 frame.ip += 1;
                 const clj: *Closure = try newClosure(gpa, fun);
 
@@ -1407,6 +1413,7 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
 }
 
 fn call(clj: *Closure, argCount: u8, vm: *VM) !bool {
+    //_ = try disassClosure(clj.function.chunk.data.items, clj.function.chunk.constants.items);
     if (argCount != clj.function.arity) {
         @panic("function arity mismatch");
     }
