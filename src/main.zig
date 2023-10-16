@@ -63,7 +63,8 @@ const Value = union(ValueTag) {
 
 const ObjUpvalue = struct {
     location: *Value,
-    //next: *
+    closed: Value,
+    next: ?*ObjUpvalue,
 };
 
 const Closure = struct {
@@ -84,6 +85,8 @@ const reset_sequence = "\x1b[0m";
 fn newUpvalue(gpa: std.mem.Allocator, value: *Value) !*ObjUpvalue {
     const up: *ObjUpvalue = try gpa.create(ObjUpvalue);
     up.location = value;
+    up.closed = Value{ .nil = void{} };
+    up.next = null;
     return up;
 }
 
@@ -268,7 +271,7 @@ fn identifiersEqual(scanner: *Scanner, a: *const Token, b: *const Token) bool {
 }
 
 fn addLocal(current: *Compiler, name: Token) !void {
-    try current.locals.append(Local{ .name = name, .depth = -1 });
+    try current.locals.append(Local{ .name = name, .depth = -1, .isCaptured = false });
 }
 
 fn declareVariable(scanner: *Scanner, parser: *Parser, current: *Compiler) !void {
@@ -374,7 +377,7 @@ fn function(gpa: std.mem.Allocator, funtyp: FunctionType, parser: *Parser, scann
         compiler.function.name = dst;
     }
 
-    var local = Local{ .depth = 0, .name = Token{ .line = 0, .typ = TokenType.ERROR, .start = 0, .length = 0 } };
+    var local = Local{ .depth = 0, .name = Token{ .line = 0, .typ = TokenType.ERROR, .start = 0, .length = 0 }, .isCaptured = false };
     try compiler.locals.append(local);
 
     compiler.beginScope();
@@ -742,6 +745,7 @@ fn resolveUpvalue(scanner: *Scanner, compiler: *Compiler, name: *const Token) ?u
 
     const local = resolveLocal(scanner, compiler.enclosing.?, name);
     if (local != -1) {
+        compiler.enclosing.?.locals.items[@intCast(usize, local)].isCaptured = true;
         return addUpvalue(compiler, @intCast(u8, local), true);
     }
 
@@ -865,7 +869,7 @@ fn disassembleChunk(gpa: std.mem.Allocator, opdata: []const u8, constants: []con
             try stdout.print("constant {d} {s}\n", .{ constidx, try showVal(gpa, constants[constidx]) });
         }
         switch (o) {
-            .GET_LOCAL, .SET_LOCAL, .SET_GLOBAL, .GET_GLOBAL, .CONSTANT, .DEFINE_GLOBAL, .CALL, .GET_UPVALUE, .SET_UPVALUE => {
+            .GET_LOCAL, .SET_LOCAL, .SET_GLOBAL, .GET_GLOBAL, .CONSTANT, .DEFINE_GLOBAL, .CALL, .GET_UPVALUE, .SET_UPVALUE, .CLOSE_UPVALUE => {
                 opidx += 1;
             },
             .CLOSURE => {
@@ -875,7 +879,7 @@ fn disassembleChunk(gpa: std.mem.Allocator, opdata: []const u8, constants: []con
             .JUMP, .JUMP_IF_FALSE, .LOOP => {
                 opidx += 2;
             },
-            .POP => {},
+            .POP, .NIL => {},
             else => {
                 try stdout.print("{s}: ", .{@tagName(o)});
                 try bw.flush();
@@ -889,6 +893,7 @@ fn disassembleChunk(gpa: std.mem.Allocator, opdata: []const u8, constants: []con
 const Local = struct {
     name: Token,
     depth: i16,
+    isCaptured: bool,
 };
 
 const Upvalue = struct {
@@ -920,7 +925,11 @@ const Compiler = struct {
         while (this.locals.items.len > 0 and
             this.locals.getLast().depth > this.scopeDepth)
         {
-            try this.currentChunk().data.append(@intFromEnum(Op.POP));
+            if (this.locals.getLast().isCaptured) {
+                try this.currentChunk().data.append(@intFromEnum(Op.CLOSE_UPVALUE));
+            } else {
+                try this.currentChunk().data.append(@intFromEnum(Op.POP));
+            }
             _ = this.locals.pop();
         }
     }
@@ -984,6 +993,7 @@ pub fn main() !void {
         .frames = std.ArrayList(CallFrame).init(gpa),
         .stack = undefined,
         .stackTop = 0,
+        .openUpvalues = null,
     };
     const clj = try newClosure(gpa, &fun);
     vm.stackTop += 1;
@@ -1063,6 +1073,7 @@ const VM = struct {
     frames: std.ArrayList(CallFrame),
     stackTop: usize,
     stack: [256]Value,
+    openUpvalues: ?*ObjUpvalue,
 };
 
 fn get_function(val: Value) !*Function {
@@ -1260,12 +1271,16 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
                     frame.ip += 1;
                     try stdout.print("isLocal: {d}, index at chunk->code idx {d}: {d}\n", .{ isLocal, frame.ip - 1, index });
                     if (isLocal == 1) {
-                        clj.upvalues.items[i] = try captureUpvalue(gpa, &vm.stack[frame.slotsOffset + index + 1]);
+                        clj.upvalues.items[i] = try captureUpvalue(gpa, &vm.stack[frame.slotsOffset + index + 1], vm);
                     } else {
                         try stdout.print("reading from frame upvalues, which has length {d}\n", .{frame.closure.upvalues.items.len});
                         clj.upvalues.items[i] = frame.closure.upvalues.items[index];
                     }
                 }
+            },
+            .CLOSE_UPVALUE => {
+                closeUpvalues(&vm.stack[vm.stackTop], vm);
+                vm.stackTop -= 1;
             },
             .RETURN => {
                 try stdout.print("return: {s} read from stackTop={d}\n", .{ try showVal(gpa, vm.stack[vm.stackTop]), vm.stackTop });
@@ -1273,6 +1288,8 @@ fn runChunk(gpa: std.mem.Allocator, vm: *VM) !void {
                 // pop
                 const result = vm.stack[vm.stackTop];
                 vm.stackTop -= 1;
+
+                closeUpvalues(&vm.stack[frame.slotsOffset + 1], vm);
 
                 if (vm.frames.items.len == 1) {
                     vm.stackTop -= 1; // pop
@@ -1452,9 +1469,37 @@ fn callValue(callee: Value, argCount: u8, vm: *VM) !bool {
     }
 }
 
-fn captureUpvalue(gpa: std.mem.Allocator, local: *Value) !*ObjUpvalue {
+fn captureUpvalue(gpa: std.mem.Allocator, local: *Value, vm: *VM) !*ObjUpvalue {
+    var prevUpvalue: ?*ObjUpvalue = null;
+    var upvalue: ?*ObjUpvalue = vm.openUpvalues;
+    while (upvalue != null and @intFromPtr(upvalue.?.location) > @intFromPtr(local)) {
+        prevUpvalue = upvalue.?;
+        upvalue = upvalue.?.next;
+    }
+
+    if (upvalue != null and upvalue.?.location == local) {
+        return upvalue.?;
+    }
+
     const createdUpvalue: *ObjUpvalue = try newUpvalue(gpa, local);
+    createdUpvalue.next = upvalue;
+
+    if (prevUpvalue == null) {
+        vm.openUpvalues = createdUpvalue;
+    } else {
+        prevUpvalue.?.next = createdUpvalue;
+    }
+
     return createdUpvalue;
+}
+
+fn closeUpvalues(last: *Value, vm: *VM) void {
+    while (vm.openUpvalues != null and @intFromPtr(vm.openUpvalues.?.location) >= @intFromPtr(last)) {
+        var upvalue: *ObjUpvalue = vm.openUpvalues.?;
+        upvalue.closed = upvalue.location.*;
+        upvalue.location = &upvalue.closed;
+        vm.openUpvalues = upvalue.next;
+    }
 }
 
 fn concatAndReturnBuffer(allocator: std.mem.Allocator, one: []const u8, two: []const u8) ![]u8 {
@@ -1495,6 +1540,7 @@ const Op = enum(u8) {
     NOT,
     NEGATE,
     CLOSURE,
+    CLOSE_UPVALUE,
     RETURN,
     PRINT,
     JUMP,

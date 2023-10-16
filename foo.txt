@@ -1,8 +1,24 @@
-fun outer() {
-  var x = "outside";
-  fun inner() {
-    print x;
+var globalOne;
+var globalTwo;
+
+fun main() {
+  {
+    var a = "one";
+    fun one() {
+      print a;
+    }
+    globalOne = one;
   }
-  inner();
+
+  {
+    var a = "two";
+    fun two() {
+      print a;
+    }
+    globalTwo = two;
+  }
 }
-outer();
+
+main();
+globalOne();
+globalTwo();
